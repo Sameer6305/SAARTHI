@@ -1,0 +1,26 @@
+# SAARTHI Cloud Backend Dependencies
+# Production-grade FastAPI application
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Async Support
+httpx==0.26.0
+anyio==4.2.0
+
+# Logging & Monitoring
+structlog==24.1.0
+python-json-logger==2.0.7
+
+# Security
+python-multipart==0.0.6
+
+# Testing (optional, for development)
+pytest==7.4.4
+pytest-asyncio==0.23.3
+
+# Type checking (optional, for development)
+mypy==1.8.0
