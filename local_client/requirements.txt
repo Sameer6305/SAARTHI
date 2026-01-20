@@ -13,3 +13,22 @@ jsonschema==4.21.1
 
 # Type hints
 typing-extensions==4.9.0
+
+# ============================================
+# OPTIONAL: Voice Support (disabled by default)
+# ============================================
+# Install these ONLY if you want voice features:
+
+# Audio Capture (push-to-talk)
+sounddevice==0.4.6
+numpy==1.26.3
+
+# Speech-to-Text (local Whisper)
+# Note: openai-whisper requires ~1GB download on first use
+openai-whisper==20231117
+
+# Text-to-Speech (Windows SAPI wrapper)
+pyttsx3==2.90
+
+# Optional: For audio resampling (rarely needed)
+# scipy==1.12.0
