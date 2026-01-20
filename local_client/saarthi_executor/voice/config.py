@@ -43,8 +43,8 @@ class VoiceConfig:
     enabled: bool = False
     
     # ==================== STT SETTINGS ====================
-    # Whisper model (tiny is fastest, works on CPU)
-    whisper_model: WhisperModel = WhisperModel.TINY
+    # Whisper model (small has best accuracy for commands)
+    whisper_model: WhisperModel = WhisperModel.SMALL
     
     # Path to Whisper model (None = download on first use)
     whisper_model_path: Optional[Path] = None

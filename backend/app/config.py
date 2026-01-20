@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     planner_max_steps: int = 20
     planner_timeout_seconds: float = 30.0
     
+    # === Action Configuration ===
+    action_expiry_minutes: int = 5  # Actions expire after 5 minutes
+    max_actions_per_task: int = 10  # Maximum actions per task
+    
+    # === Request Timeouts ===
+    request_timeout_seconds: float = 60.0  # Overall request timeout
+    intent_analysis_timeout_seconds: float = 10.0
+    plan_generation_timeout_seconds: float = 20.0
+    
+    # === Rate Limiting ===
+    rate_limit_requests_per_minute: int = 60
+    rate_limit_tasks_per_minute: int = 30
+    
+    # === Security ===
+    secret_key: str = ""  # MUST be set in production via environment variable
+    
     # === Logging Configuration ===
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "console"] = "json"

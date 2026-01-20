@@ -126,6 +126,62 @@ class SecurityLogger:
         self._logger.info(
             f"STATE_TRANSITION | {from_state} -> {to_state} | {reason}"
         )
+    
+    # =========================================================================
+    # BACKEND COMMUNICATION LOGGING (NEW)
+    # =========================================================================
+    
+    def backend_connected(self, url: str) -> None:
+        """Log successful backend connection."""
+        self._logger.info(
+            f"BACKEND_CONNECTED | {url}"
+        )
+    
+    def backend_disconnected(self, url: str) -> None:
+        """Log backend disconnection."""
+        self._logger.info(
+            f"BACKEND_DISCONNECTED | {url}"
+        )
+    
+    def backend_connection_failed(self, url: str, error: str) -> None:
+        """Log failed backend connection."""
+        self._logger.error(
+            f"BACKEND_CONNECTION_FAILED | {url} | {error}"
+        )
+    
+    def command_sent(
+        self, 
+        task_id: str, 
+        input_length: int
+    ) -> None:
+        """Log command sent to backend."""
+        self._logger.info(
+            f"COMMAND_SENT | {task_id} | input_length={input_length}"
+        )
+    
+    def command_failed(self, error: str) -> None:
+        """Log failed command."""
+        self._logger.warning(
+            f"COMMAND_FAILED | {error}"
+        )
+    
+    def actions_received(
+        self, 
+        task_id: str, 
+        action_count: int, 
+        action_types: list[str]
+    ) -> None:
+        """Log actions received from backend."""
+        types_str = ", ".join(action_types)
+        self._logger.info(
+            f"ACTIONS_RECEIVED | {task_id} | count={action_count} | types=[{types_str}]"
+        )
+    
+    def actions_fetch_failed(self, task_id: str, error: str) -> None:
+        """Log failed action fetch."""
+        self._logger.warning(
+            f"ACTIONS_FETCH_FAILED | {task_id} | {error}"
+        )
 
 
 # Global security logger instance

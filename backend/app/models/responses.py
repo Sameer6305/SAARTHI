@@ -91,6 +91,16 @@ class TaskResponse(BaseModel):
         default=None,
         description="Number of steps in the generated plan.",
     )
+    
+    error_code: Optional[str] = Field(
+        default=None,
+        description="Internal error code for debugging (no sensitive info).",
+    )
+    
+    recoverable: Optional[bool] = Field(
+        default=None,
+        description="Whether the error is recoverable by retrying.",
+    )
 
 
 class StatusResponse(BaseModel):

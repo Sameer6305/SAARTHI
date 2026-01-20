@@ -15,10 +15,17 @@ SECURITY INVARIANTS:
 - NO file deletion or modification
 - NO registry access
 - Only user-selected files can be read
+
+ERROR HANDLING:
+- All actions have execution timeouts
+- Browser/media failures are explicitly detected
+- Clear error messages for user
+- All failures logged
 """
 
 import logging
 import os
+import time
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog
@@ -26,6 +33,26 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+from saarthi_executor.error_handling import (
+    ExecutionTimeoutError,
+    create_browser_failure_error,
+    create_execution_timeout_error,
+    create_media_failure_error,
+    get_error_logger,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# TIMEOUT CONFIGURATION
+# =============================================================================
+
+BROWSER_OPEN_TIMEOUT_SECONDS = 10.0
+MEDIA_OPEN_TIMEOUT_SECONDS = 10.0
+FILE_PICKER_TIMEOUT_SECONDS = 120.0  # 2 minutes for user selection
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +109,11 @@ class OpenBrowserUrlHandler(ActionHandler):
     - Only http:// and https:// URLs
     - URL already validated by ActionValidator
     - Uses webbrowser module (safe, no shell)
+    
+    ERROR HANDLING:
+    - Timeout after BROWSER_OPEN_TIMEOUT_SECONDS
+    - Explicit failure detection
+    - Clear error messages
     """
     
     @property
@@ -93,8 +125,14 @@ class OpenBrowserUrlHandler(ActionHandler):
         action_id: str,
         parameters: dict,
     ) -> ActionResult:
-        """Open URL in default browser."""
+        """
+        Open URL in default browser with timeout.
+        
+        TIMEOUT: BROWSER_OPEN_TIMEOUT_SECONDS
+        ON FAILURE: Returns ActionResult with clear error
+        """
         url = parameters.get("url", "")
+        error_logger = get_error_logger()
         
         if not url:
             return ActionResult(
@@ -105,10 +143,41 @@ class OpenBrowserUrlHandler(ActionHandler):
                 error="Missing URL parameter",
             )
         
+        start_time = time.monotonic()
+        
         try:
-            # webbrowser.open is safe - it only opens URLs in browser
-            # It does NOT execute shell commands
-            success = webbrowser.open(url, new=2)  # new=2 opens in new tab
+            # Execute browser open with timeout using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(webbrowser.open, url, 2)  # new=2 opens in new tab
+                
+                try:
+                    success = future.result(timeout=BROWSER_OPEN_TIMEOUT_SECONDS)
+                except FuturesTimeoutError:
+                    elapsed = time.monotonic() - start_time
+                    logger.error(
+                        "Browser open timeout",
+                        extra={
+                            "action_id": action_id,
+                            "url": url[:50],
+                            "timeout": BROWSER_OPEN_TIMEOUT_SECONDS,
+                            "elapsed": elapsed,
+                        }
+                    )
+                    
+                    user_error = create_execution_timeout_error(
+                        action_type=self.action_type,
+                        action_id=action_id,
+                        timeout_seconds=BROWSER_OPEN_TIMEOUT_SECONDS,
+                    )
+                    error_logger.log_error(user_error)
+                    
+                    return ActionResult(
+                        success=False,
+                        action_id=action_id,
+                        action_type=self.action_type,
+                        message=user_error.message,
+                        error="EXECUTION_TIMEOUT",
+                    )
             
             if success:
                 logger.info(
@@ -127,15 +196,39 @@ class OpenBrowserUrlHandler(ActionHandler):
                     data={"url_opened": True},
                 )
             else:
+                # Browser open returned False - explicit failure
+                user_error = create_browser_failure_error(
+                    url=url,
+                    action_id=action_id,
+                    reason="Browser could not open the URL",
+                )
+                error_logger.log_error(user_error)
+                
+                logger.warning(
+                    "Browser open returned False",
+                    extra={
+                        "action_id": action_id,
+                        "url": url[:50],
+                    }
+                )
+                
                 return ActionResult(
                     success=False,
                     action_id=action_id,
                     action_type=self.action_type,
-                    message="Failed to open browser",
-                    error="webbrowser.open returned False",
+                    message=user_error.message,
+                    error="BROWSER_OPEN_FAILED",
                 )
                 
         except Exception as e:
+            # Unexpected error during browser open
+            user_error = create_browser_failure_error(
+                url=url,
+                action_id=action_id,
+                reason=str(e),
+            )
+            error_logger.log_error(user_error)
+            
             logger.error(
                 "Failed to open URL",
                 extra={
@@ -148,7 +241,7 @@ class OpenBrowserUrlHandler(ActionHandler):
                 success=False,
                 action_id=action_id,
                 action_type=self.action_type,
-                message="Failed to open browser",
+                message=user_error.message,
                 error=str(e),
             )
     
@@ -171,6 +264,11 @@ class PlayMediaFileHandler(ActionHandler):
     - Uses file picker for user selection
     - Only opens, does not modify
     - Uses os.startfile (Windows) which is safe for media
+    
+    ERROR HANDLING:
+    - Timeout for file picker and media open
+    - Clear error on media open failure
+    - User cancellation is not an error
     """
     
     MEDIA_EXTENSIONS = {
@@ -188,8 +286,14 @@ class PlayMediaFileHandler(ActionHandler):
         action_id: str,
         parameters: dict,
     ) -> ActionResult:
-        """Let user select and play a media file."""
+        """
+        Let user select and play a media file.
+        
+        TIMEOUT: MEDIA_OPEN_TIMEOUT_SECONDS for playback
+        ON FAILURE: Returns ActionResult with clear error
+        """
         media_type = parameters.get("media_type", "audio")
+        error_logger = get_error_logger()
         
         # Get allowed extensions for this media type
         extensions = self.MEDIA_EXTENSIONS.get(media_type, [])
@@ -224,6 +328,7 @@ class PlayMediaFileHandler(ActionHandler):
             root.destroy()
             
             if not file_path:
+                # User cancelled - not an error, just informational
                 return ActionResult(
                     success=False,
                     action_id=action_id,
@@ -243,28 +348,94 @@ class PlayMediaFileHandler(ActionHandler):
                     error="Selected file does not match media type",
                 )
             
-            # Open with default application
+            # Open with default application with timeout
             # os.startfile is safe - it only opens files with associated apps
-            os.startfile(file_path)
+            start_time = time.monotonic()
             
-            logger.info(
-                "Media file opened",
-                extra={
-                    "action_id": action_id,
-                    "media_type": media_type,
-                    "file_extension": ext,
-                }
-            )
-            
-            return ActionResult(
-                success=True,
-                action_id=action_id,
-                action_type=self.action_type,
-                message=f"Playing {media_type} file",
-                data={"file_opened": True, "media_type": media_type},
-            )
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(os.startfile, file_path)
+                    
+                    try:
+                        future.result(timeout=MEDIA_OPEN_TIMEOUT_SECONDS)
+                    except FuturesTimeoutError:
+                        elapsed = time.monotonic() - start_time
+                        logger.error(
+                            "Media open timeout",
+                            extra={
+                                "action_id": action_id,
+                                "media_type": media_type,
+                                "timeout": MEDIA_OPEN_TIMEOUT_SECONDS,
+                                "elapsed": elapsed,
+                            }
+                        )
+                        
+                        user_error = create_execution_timeout_error(
+                            action_type=self.action_type,
+                            action_id=action_id,
+                            timeout_seconds=MEDIA_OPEN_TIMEOUT_SECONDS,
+                        )
+                        error_logger.log_error(user_error)
+                        
+                        return ActionResult(
+                            success=False,
+                            action_id=action_id,
+                            action_type=self.action_type,
+                            message=user_error.message,
+                            error="EXECUTION_TIMEOUT",
+                        )
+                
+                logger.info(
+                    "Media file opened",
+                    extra={
+                        "action_id": action_id,
+                        "media_type": media_type,
+                        "file_extension": ext,
+                    }
+                )
+                
+                return ActionResult(
+                    success=True,
+                    action_id=action_id,
+                    action_type=self.action_type,
+                    message=f"Playing {media_type} file",
+                    data={"file_opened": True, "media_type": media_type},
+                )
+                
+            except OSError as e:
+                # Specific OS error (file not found, permission denied, etc.)
+                user_error = create_media_failure_error(
+                    media_type=media_type,
+                    action_id=action_id,
+                    reason=str(e),
+                )
+                error_logger.log_error(user_error)
+                
+                logger.error(
+                    "OS error opening media",
+                    extra={
+                        "action_id": action_id,
+                        "error": str(e),
+                    }
+                )
+                
+                return ActionResult(
+                    success=False,
+                    action_id=action_id,
+                    action_type=self.action_type,
+                    message=user_error.message,
+                    error=str(e),
+                )
             
         except Exception as e:
+            # Unexpected error
+            user_error = create_media_failure_error(
+                media_type=media_type,
+                action_id=action_id,
+                reason=str(e),
+            )
+            error_logger.log_error(user_error)
+            
             logger.error(
                 "Failed to play media",
                 extra={
@@ -277,7 +448,7 @@ class PlayMediaFileHandler(ActionHandler):
                 success=False,
                 action_id=action_id,
                 action_type=self.action_type,
-                message="Failed to play media file",
+                message=user_error.message,
                 error=str(e),
             )
     

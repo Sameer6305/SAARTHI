@@ -11,6 +11,14 @@ This is the entry point that ties everything together:
 - Action validators
 - Action handlers
 - Cloud communication
+- VOICE INPUT (PRIMARY interaction method)
+
+VOICE INPUT:
+- Push-to-talk ONLY (no background listening)
+- Voice treated as UNTRUSTED input (same as text)
+- Same permission flow, same allowlist, same logging
+- Local Whisper STT (no cloud)
+- Audio exists only in memory
 """
 
 import logging
@@ -23,10 +31,38 @@ from typing import Optional
 
 from saarthi_executor.state_machine import StateMachine, ExecutorState
 from saarthi_executor.validator import ActionValidator, ValidationResult
-from saarthi_executor.permission_manager import PermissionManager, PermissionDecision
+from saarthi_executor.permission_manager import PermissionManager, PermissionDecision as LegacyPermissionDecision
+from saarthi_executor.permission_enforcer import (
+    PermissionEnforcer,
+    PermissionDecision,
+    create_permission_enforcer,
+    ACTION_ALLOWLIST,
+)
 from saarthi_executor.action_handlers import ActionHandlerRegistry, ActionResult
 from saarthi_executor.cloud_client import CloudClient, MockCloudClient, CloudConfig
+from saarthi_executor.backend_client import (
+    BackendClient,
+    BackendConfig,
+    create_backend_client,
+    TaskCreationResult,
+    ActionsResult,
+    ConnectionState,
+)
 from saarthi_executor.tray_app import TrayIcon
+from saarthi_executor.command_dialog import (
+    CommandDialog,
+    DialogResult,
+    CommandResult,
+    show_command_dialog,
+)
+from saarthi_executor.voice_command_dialog import (
+    VoiceCommandDialog,
+    VoiceDialogResult,
+    VoiceCommandResult,
+    show_voice_command_dialog,
+)
+from saarthi_executor.voice.integration import VoiceIntegration
+from saarthi_executor.voice.config import VoiceConfig
 from saarthi_executor.logging_config import setup_logging, security_logger
 
 logger = logging.getLogger(__name__)
@@ -41,24 +77,76 @@ class SaarthiExecutor:
     - Only allowlisted actions can execute
     - All events are logged
     - Fail-closed on any error
+    - Voice input treated IDENTICALLY to text (no special trust)
+    
+    ARCHITECTURE:
+    - Uses BackendClient for real HTTP communication
+    - Commands sent via send_command() method
+    - Voice input is PRIMARY interaction method
+    - Actions received but NOT executed in this integration phase
     """
     
     # Polling interval when listening (seconds)
     POLL_INTERVAL: float = 2.0
     
-    def __init__(self, use_mock_cloud: bool = True):
-        """Initialize the executor."""
+    # Backend configuration
+    BACKEND_URL: str = "http://localhost:8000"
+    BACKEND_TIMEOUT: float = 30.0
+    
+    def __init__(
+        self, 
+        use_mock_cloud: bool = False, 
+        use_real_backend: bool = True,
+        enable_voice: bool = True,
+    ):
+        """
+        Initialize the executor.
+        
+        Args:
+            use_mock_cloud: If True, use MockCloudClient (legacy)
+            use_real_backend: If True, use real BackendClient for HTTP calls
+            enable_voice: If True, enable voice input features
+        """
         # Core components
         self._state_machine = StateMachine()
         self._validator = ActionValidator()
-        self._permission_manager = PermissionManager()
+        self._permission_manager = PermissionManager()  # Legacy
+        self._permission_enforcer = create_permission_enforcer()  # NEW: Strong enforcement
         self._action_registry = ActionHandlerRegistry()
         
-        # Cloud client
+        # Backend client (real HTTP integration)
+        self._use_real_backend = use_real_backend
+        self._backend_client: Optional[BackendClient] = None
+        
+        if use_real_backend:
+            self._backend_client = create_backend_client(
+                base_url=self.BACKEND_URL,
+                timeout=self.BACKEND_TIMEOUT
+            )
+            logger.info(
+                "BackendClient created",
+                extra={"url": self.BACKEND_URL}
+            )
+        
+        # Legacy cloud client (for backward compatibility)
         if use_mock_cloud:
             self._cloud_client = MockCloudClient()
         else:
             self._cloud_client = CloudClient(CloudConfig())
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # VOICE INTEGRATION (NEW)
+        # Voice input is the PRIMARY interaction method
+        # Voice is treated IDENTICALLY to text input - no special trust
+        # ═══════════════════════════════════════════════════════════════════
+        self._enable_voice = enable_voice
+        self._voice_integration: Optional[VoiceIntegration] = None
+        
+        if enable_voice:
+            self._voice_integration = VoiceIntegration(
+                on_voice_input=self._handle_voice_text,
+            )
+            logger.info("Voice integration created")
         
         # Tray application
         self._tray: Optional[TrayIcon] = None
@@ -67,7 +155,14 @@ class SaarthiExecutor:
         self._running = False
         self._listener_thread: Optional[threading.Thread] = None
         
-        logger.info("SAARTHI Executor initialized")
+        # Current session
+        self._session_id: Optional[str] = None
+        
+        logger.info("SAARTHI Executor initialized", extra={
+            "use_real_backend": use_real_backend,
+            "use_mock_cloud": use_mock_cloud,
+            "enable_voice": enable_voice,
+        })
     
     def start(self) -> None:
         """Start the executor application."""
@@ -75,9 +170,31 @@ class SaarthiExecutor:
         
         self._running = True
         
-        # Connect to cloud
+        # Connect to real backend
+        if self._backend_client:
+            if self._backend_client.connect():
+                logger.info(
+                    "Connected to backend successfully",
+                    extra={"url": self.BACKEND_URL}
+                )
+            else:
+                logger.warning(
+                    "Could not connect to backend - ensure it's running",
+                    extra={"url": self.BACKEND_URL}
+                )
+        
+        # Connect to cloud (legacy)
         if not self._cloud_client.connect():
             logger.warning("Could not connect to cloud (will work offline)")
+        
+        # Initialize voice integration
+        if self._voice_integration:
+            if self._voice_integration.initialize():
+                logger.info("Voice integration initialized successfully")
+                # Pre-load STT model in background
+                self._voice_integration.preload_models()
+            else:
+                logger.warning("Voice integration failed to initialize")
         
         # Start listener thread
         self._listener_thread = threading.Thread(
@@ -88,9 +205,14 @@ class SaarthiExecutor:
         self._listener_thread.start()
         
         # Create and start tray icon (blocks)
+        # Voice Command is now the PRIMARY entry point
         self._tray = TrayIcon(
             state_machine=self._state_machine,
             on_exit=self.stop,
+            on_send_command=self._show_command_dialog,
+            on_voice_command=self._show_voice_command_dialog,
+            on_voice_settings=self._show_voice_settings,
+            is_voice_enabled=self._is_voice_enabled,
         )
         
         # Register state change logging
@@ -102,6 +224,7 @@ class SaarthiExecutor:
         
         # Start in SLEEP state, user must activate
         logger.info("Executor started - in SLEEP state")
+        logger.info("Voice Command is PRIMARY interaction method")
         
         # This blocks (tray icon main loop)
         self._tray.start()
@@ -112,7 +235,17 @@ class SaarthiExecutor:
         
         self._running = False
         
-        # Disconnect from cloud
+        # Clean up voice integration
+        if self._voice_integration:
+            self._voice_integration.cleanup()
+            logger.info("Voice integration cleaned up")
+        
+        # Disconnect from real backend
+        if self._backend_client:
+            self._backend_client.disconnect()
+            logger.info("Backend client disconnected")
+        
+        # Disconnect from cloud (legacy)
         self._cloud_client.disconnect()
         
         # Stop listener thread
@@ -145,24 +278,78 @@ class SaarthiExecutor:
     
     def _process_action(self, action_json: dict) -> None:
         """
-        Process an incoming action.
+        Process an incoming action with STRONG PERMISSION ENFORCEMENT.
         
         Flow:
-        1. Validate action
-        2. Get handler
-        3. Request permission
-        4. Execute if permitted
-        5. Report result
+        1. ⚠️ HARD GATE: Check if action is in allowlist (BEFORE anything else)
+        2. Validate action schema
+        3. Get handler
+        4. ⚠️ HARD GATE: Request explicit user permission via modal dialog
+        5. Execute if and ONLY if permitted
+        6. Report result
+        
+        SECURITY: 
+        - Only 'open_browser_url' and 'play_media_file' can proceed
+        - All other actions are REJECTED without showing dialog
+        - User must explicitly click ALLOW for each action
+        - No remembered permissions, no auto-approval
+        - Audit log written for every decision
         """
         action_id = action_json.get("action_id", "unknown")
         action_type = action_json.get("action_type", "unknown")
+        parameters = action_json.get("parameters", {})
+        description = action_json.get("description", "No description")
         
         logger.info(
             f"Processing action",
             extra={"action_id": action_id, "action_type": action_type}
         )
         
-        # Step 1: Validate action
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 0: HARD GATE - ACTION ALLOWLIST CHECK (BEFORE ANYTHING ELSE)
+        # ═══════════════════════════════════════════════════════════════════
+        if not self._permission_enforcer.is_action_allowed(action_type):
+            # This action is NOT in the allowlist - REJECT WITHOUT DIALOG
+            rejection_reason = f"Action '{action_type}' is not in the allowed actions list"
+            
+            # Log policy violation (method generates its own reason based on action type)
+            self._permission_enforcer.reject_policy_violation(
+                action_id=action_id,
+                action_type=action_type,
+            )
+            
+            security_logger.forbidden_action_attempted(
+                action_type,
+                rejection_reason,
+            )
+            
+            # Report rejection to cloud
+            self._cloud_client.report_action_result(
+                action_id=action_id,
+                success=False,
+                message=f"POLICY VIOLATION: {rejection_reason}",
+            )
+            
+            # Notify user
+            if self._tray:
+                self._tray.show_notification(
+                    "⛔ Action Blocked",
+                    f"'{action_type}' is not permitted by security policy",
+                )
+            
+            logger.warning(
+                f"POLICY VIOLATION: Action blocked by allowlist",
+                extra={
+                    "action_id": action_id,
+                    "action_type": action_type,
+                    "allowed_actions": list(ACTION_ALLOWLIST),
+                }
+            )
+            return
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 1: Validate action schema
+        # ═══════════════════════════════════════════════════════════════════
         validation = self._validator.validate(action_json)
         
         if not validation.is_valid:
@@ -187,7 +374,9 @@ class SaarthiExecutor:
         
         security_logger.action_validated(action_id, action_type)
         
-        # Step 2: Get handler
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 2: Get handler
+        # ═══════════════════════════════════════════════════════════════════
         handler = self._action_registry.get_handler(action_type)
         
         if not handler:
@@ -203,38 +392,75 @@ class SaarthiExecutor:
             )
             return
         
-        # Step 3: Request permission
-        parameters = action_json.get("parameters", {})
-        description = action_json.get("description", "No description")
-        risk_level = action_json.get("risk_level", "LOW")
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 3: HARD GATE - REQUEST EXPLICIT USER PERMISSION
+        # ═══════════════════════════════════════════════════════════════════
+        # This shows a MODAL dialog that BLOCKS until user responds
+        # User MUST click ALLOW or DENY - no auto-approval, no timeout-allow
         
         data_description = handler.get_data_description(parameters)
+        risk_level = action_json.get("risk_level", "LOW")
         
-        permission = self._permission_manager.request_permission(
+        # Build target description for the dialog
+        target_info = self._build_target_description(action_type, parameters)
+        
+        permission_decision = self._permission_enforcer.request_permission(
             action_id=action_id,
             action_type=action_type,
             description=description,
-            data_accessed=data_description,
+            target=target_info,
             risk_level=risk_level,
+            parameters=parameters,
         )
         
-        if permission != PermissionDecision.ALLOW:
+        # Handle permission decision - ONLY ALLOW passes through
+        if permission_decision != PermissionDecision.ALLOW:
+            # Log the denial
             security_logger.permission_denied(action_id, action_type)
             
+            # Build user-friendly message based on decision
+            denial_messages = {
+                PermissionDecision.DENY: "User explicitly denied permission",
+                PermissionDecision.TIMEOUT: "Permission request timed out (60 seconds)",
+                PermissionDecision.WINDOW_CLOSED: "Permission dialog was closed",
+                PermissionDecision.ERROR: "Error showing permission dialog",
+                PermissionDecision.REJECTED: "Action rejected by policy",
+            }
+            denial_reason = denial_messages.get(
+                permission_decision, 
+                f"Permission denied: {permission_decision.value}"
+            )
+            
+            # Report to cloud
             self._cloud_client.report_action_result(
                 action_id=action_id,
                 success=False,
-                message=f"User denied permission: {permission.value}",
+                message=denial_reason,
             )
             
+            # Notify user
             if self._tray:
                 self._tray.show_notification(
-                    "Action Denied",
-                    f"You denied: {action_type}",
+                    "❌ Action Denied",
+                    f"{action_type}: {denial_reason}",
                 )
+            
+            logger.info(
+                f"Permission denied for action",
+                extra={
+                    "action_id": action_id,
+                    "action_type": action_type,
+                    "decision": permission_decision.value,
+                }
+            )
             return
         
+        # ✅ Permission GRANTED - log it
         security_logger.permission_granted(action_id, action_type)
+        logger.info(
+            f"✅ Permission GRANTED for action",
+            extra={"action_id": action_id, "action_type": action_type}
+        )
         
         # Step 4: Execute action
         # Transition to ACTIVE state
@@ -287,6 +513,37 @@ class SaarthiExecutor:
             # Always transition back to LISTENING
             self._state_machine.finish_execution(True)
     
+    def _build_target_description(self, action_type: str, parameters: dict) -> str:
+        """
+        Build a user-friendly target description for the permission dialog.
+        
+        This extracts the key target info (URL, file path, etc.) from 
+        action parameters to show the user exactly WHAT will be executed.
+        
+        Args:
+            action_type: The action type being requested
+            parameters: Action parameters dict
+            
+        Returns:
+            Human-readable target description
+        """
+        if action_type == "open_browser_url":
+            url = parameters.get("url", "unknown URL")
+            return f"URL: {url}"
+        
+        elif action_type == "play_media_file":
+            file_path = parameters.get("file_path", "unknown file")
+            return f"File: {file_path}"
+        
+        else:
+            # Fallback for any other action types
+            # Show first parameter value or "No target specified"
+            if parameters:
+                first_key = list(parameters.keys())[0]
+                first_value = parameters[first_key]
+                return f"{first_key}: {first_value}"
+            return "No target specified"
+    
     def inject_test_action(self, action: dict) -> None:
         """
         Inject a test action for testing purposes.
@@ -296,6 +553,559 @@ class SaarthiExecutor:
         if isinstance(self._cloud_client, MockCloudClient):
             self._cloud_client.add_test_action(action)
             logger.info("Test action injected")
+    
+    # =========================================================================
+    # COMMAND DIALOG INTEGRATION
+    # =========================================================================
+    
+    def _show_command_dialog(self) -> None:
+        """
+        Show the command input dialog.
+        
+        Called when user clicks "Send Command" in tray menu.
+        Opens a modal dialog for text input.
+        """
+        logger.info("Opening command dialog")
+        
+        try:
+            result = show_command_dialog(
+                on_send=self._handle_dialog_send
+            )
+            
+            if result:
+                logger.info(
+                    "Command dialog closed",
+                    extra={
+                        "result": result.result.value,
+                        "task_id": result.task_id
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"Error showing command dialog: {e}")
+            if self._tray:
+                self._tray.show_notification(
+                    "Dialog Error",
+                    f"Failed to open command dialog: {e}"
+                )
+    
+    def _handle_dialog_send(self, input_text: str) -> DialogResult:
+        """
+        Handle command from dialog - send to backend.
+        
+        This is the callback passed to the command dialog.
+        It sends the command to the backend and returns the result.
+        
+        Args:
+            input_text: Validated user input from dialog
+            
+        Returns:
+            DialogResult with task outcome
+        """
+        logger.info(
+            "Handling dialog send",
+            extra={"input_length": len(input_text)}
+        )
+        
+        # Check backend connection
+        if not self._backend_client:
+            return DialogResult(
+                result=CommandResult.BACKEND_ERROR,
+                error="Backend client not configured"
+            )
+        
+        if not self._backend_client.is_connected:
+            logger.info("Backend not connected, attempting to connect")
+            if not self._backend_client.connect():
+                return DialogResult(
+                    result=CommandResult.BACKEND_ERROR,
+                    error="Cannot connect to backend. Is it running at localhost:8000?"
+                )
+        
+        # Send command to backend
+        try:
+            task_result = self._backend_client.send_command(
+                input_text=input_text,
+                session_id=self._session_id
+            )
+            
+            if task_result.success:
+                # Build success message
+                message_parts = []
+                if task_result.intent_summary:
+                    message_parts.append(f"Intent: {task_result.intent_summary}")
+                if task_result.step_count:
+                    message_parts.append(f"Steps: {task_result.step_count}")
+                
+                return DialogResult(
+                    result=CommandResult.SUCCESS,
+                    task_id=task_result.task_id,
+                    status=task_result.status,
+                    message="\n".join(message_parts) if message_parts else None
+                )
+            else:
+                return DialogResult(
+                    result=CommandResult.BACKEND_ERROR,
+                    error=task_result.error or "Backend rejected the command"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error sending command: {e}")
+            return DialogResult(
+                result=CommandResult.BACKEND_ERROR,
+                error=f"Error: {str(e)}"
+            )
+
+    # =========================================================================
+    # VOICE COMMAND INTEGRATION (PRIMARY INPUT METHOD)
+    # =========================================================================
+    
+    def _is_voice_enabled(self) -> bool:
+        """Check if voice features are enabled."""
+        return self._voice_integration is not None and self._voice_integration.is_enabled
+    
+    def _show_voice_command_dialog(self) -> None:
+        """
+        Show the voice command dialog (PRIMARY interaction method).
+        
+        Called when user clicks "Voice Command" in tray menu.
+        Opens push-to-talk dialog for voice input.
+        
+        SECURITY:
+        - Voice input is treated IDENTICALLY to text input
+        - Same permission flow, same allowlist, same logging
+        - No special trust for voice input
+        """
+        logger.info("Opening voice command dialog (PRIMARY)")
+        
+        if not self._voice_integration:
+            logger.error("Voice integration not available")
+            if self._tray:
+                self._tray.show_notification(
+                    "Voice Not Available",
+                    "Voice features are not enabled"
+                )
+            return
+        
+        # Initialize if needed
+        if not self._voice_integration.is_enabled:
+            logger.info("Enabling voice features")
+            if not self._voice_integration.enable_voice():
+                logger.error("Failed to enable voice features")
+                if self._tray:
+                    self._tray.show_notification(
+                        "Voice Error",
+                        "Failed to enable voice features"
+                    )
+                return
+        
+        try:
+            # Show voice dialog with callbacks
+            result = show_voice_command_dialog(
+                on_start_recording=self._voice_start_recording,
+                on_stop_recording=self._voice_stop_recording,
+                on_send_text=self._voice_send_text,
+                on_cancel_recording=self._voice_cancel_recording,
+            )
+            
+            if result:
+                logger.info(
+                    "Voice command dialog closed",
+                    extra={
+                        "result": result.result.value,
+                        "task_id": result.task_id,
+                        "transcribed_text": result.transcribed_text[:50] if result.transcribed_text else None,
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(f"Error showing voice command dialog: {e}")
+            if self._tray:
+                self._tray.show_notification(
+                    "Voice Dialog Error",
+                    f"Failed to open voice dialog: {e}"
+                )
+    
+    def _voice_start_recording(self) -> bool:
+        """
+        Start push-to-talk recording.
+        
+        Called when user PRESSES the talk button.
+        """
+        logger.info("Voice: Starting push-to-talk recording")
+        
+        if not self._voice_integration:
+            return False
+        
+        # Update tray icon to show recording
+        if self._tray:
+            self._tray.set_recording_state(True)
+        
+        success = self._voice_integration.start_push_to_talk()
+        
+        if success:
+            # Log for audit
+            security_logger.info(
+                "Voice recording started",
+                extra={"source": "push_to_talk"}
+            )
+        
+        return success
+    
+    def _voice_stop_recording(self) -> Optional[tuple[str, float]]:
+        """
+        Stop push-to-talk recording and get transcription.
+        
+        Called when user RELEASES the talk button.
+        
+        Returns:
+            (transcribed_text, confidence) or None on failure
+        """
+        logger.info("Voice: Stopping push-to-talk recording")
+        
+        # Update tray icon
+        if self._tray:
+            self._tray.set_recording_state(False)
+        
+        if not self._voice_integration:
+            return None
+        
+        # Stop recording and get transcription
+        # This is where audio is processed and immediately discarded
+        text = self._voice_integration.stop_push_to_talk()
+        
+        if text:
+            # Get confidence from voice integration (simplified)
+            # In full implementation, this would come from the STT result
+            confidence = 0.85  # Placeholder - will be from actual STT
+            
+            logger.info(
+                "Voice: Transcription complete",
+                extra={
+                    "text_length": len(text),
+                    "confidence": confidence,
+                }
+            )
+            
+            security_logger.info(
+                "Voice transcription complete",
+                extra={"text_preview": text[:30] + "..." if len(text) > 30 else text}
+            )
+            
+            return (text, confidence)
+        
+        return None
+    
+    def _voice_cancel_recording(self) -> None:
+        """Cancel push-to-talk recording."""
+        logger.info("Voice: Recording cancelled")
+        
+        # Update tray icon
+        if self._tray:
+            self._tray.set_recording_state(False)
+        
+        if self._voice_integration:
+            self._voice_integration.cancel_push_to_talk()
+    
+    def _voice_send_text(self, text: str) -> Optional[str]:
+        """
+        Send transcribed voice text to backend.
+        
+        This is called with the final text (after optional editing).
+        Voice text goes through EXACTLY the same flow as typed text.
+        
+        SECURITY:
+        - Voice input treated as UNTRUSTED
+        - Same backend flow as text input
+        - Same permission enforcement
+        
+        Args:
+            text: Transcribed (and possibly edited) text
+            
+        Returns:
+            task_id if successful, None on failure
+        """
+        logger.info(
+            "Voice: Sending command to backend",
+            extra={"text_length": len(text), "source": "voice"}
+        )
+        
+        # Log for audit - voice input is treated as untrusted
+        security_logger.info(
+            "Voice command submitted",
+            extra={
+                "source": "voice_push_to_talk",
+                "text_preview": text[:50] + "..." if len(text) > 50 else text,
+            }
+        )
+        
+        # Send through SAME pipeline as text input
+        # No special trust, no bypass
+        result = self._handle_dialog_send(text)
+        
+        if result.result == CommandResult.SUCCESS:
+            return result.task_id
+        else:
+            logger.warning(
+                "Voice command failed",
+                extra={"error": result.error}
+            )
+            return None
+    
+    def _handle_voice_text(self, text: str) -> None:
+        """
+        Handle voice input text from integration callback.
+        
+        This is an alternative entry point for voice text.
+        Goes through same flow as dialog.
+        
+        Args:
+            text: Transcribed text from voice input
+        """
+        logger.info(
+            "Voice integration callback: text received",
+            extra={"text_length": len(text)}
+        )
+        
+        # Send through same pipeline
+        result = self.send_command(text)
+        
+        if result and result.success:
+            logger.info(
+                "Voice command processed successfully",
+                extra={"task_id": result.task_id}
+            )
+        else:
+            logger.warning("Voice command processing failed")
+    
+    def _show_voice_settings(self) -> None:
+        """Show voice settings dialog."""
+        logger.info("Opening voice settings dialog")
+        
+        if self._voice_integration:
+            self._voice_integration.show_settings()
+        else:
+            if self._tray:
+                self._tray.show_notification(
+                    "Voice Not Available",
+                    "Voice features are not enabled"
+                )
+
+    # =========================================================================
+    # BACKEND INTEGRATION (NEW)
+    # =========================================================================
+    
+    def send_command(self, input_text: str) -> Optional[TaskCreationResult]:
+        """
+        Send a user command to the backend for planning.
+        
+        This is the PRIMARY integration point for the local client.
+        
+        FLOW:
+        1. Validate that we're connected to backend
+        2. Send command via HTTP
+        3. Receive task creation result
+        4. Log the result
+        5. Return structured result (NO execution)
+        
+        Args:
+            input_text: User's natural language command
+            
+        Returns:
+            TaskCreationResult with task_id and status, or None on failure
+        """
+        if not self._backend_client:
+            logger.error("No backend client configured")
+            return None
+        
+        if not self._backend_client.is_connected:
+            logger.warning("Backend not connected, attempting reconnection")
+            if not self._backend_client.connect():
+                logger.error("Failed to reconnect to backend")
+                if self._tray:
+                    self._tray.show_notification(
+                        "Connection Error",
+                        "Cannot connect to backend"
+                    )
+                return None
+        
+        # Log outgoing request (sanitized)
+        logger.info(
+            "Sending command to backend",
+            extra={
+                "input_length": len(input_text),
+                "session_id": self._session_id
+            }
+        )
+        
+        # Send command
+        result = self._backend_client.send_command(
+            input_text=input_text,
+            session_id=self._session_id
+        )
+        
+        if result.success:
+            logger.info(
+                "Command sent successfully",
+                extra={
+                    "task_id": result.task_id,
+                    "status": result.status,
+                    "step_count": result.step_count,
+                    "intent_summary": result.intent_summary
+                }
+            )
+            
+            if self._tray:
+                self._tray.show_notification(
+                    "Task Created",
+                    f"Task: {result.task_id}\nStatus: {result.status}"
+                )
+        else:
+            logger.warning(
+                "Command failed",
+                extra={"error": result.error}
+            )
+            
+            if self._tray:
+                self._tray.show_notification(
+                    "Command Failed",
+                    result.error or "Unknown error"
+                )
+        
+        return result
+    
+    def fetch_actions(self, task_id: str) -> Optional[ActionsResult]:
+        """
+        Fetch executable actions for a task from the backend.
+        
+        This retrieves the planner output in executor-compatible format.
+        
+        NOTE: This does NOT execute the actions.
+        
+        Args:
+            task_id: Task ID from send_command()
+            
+        Returns:
+            ActionsResult with action list, or None on failure
+        """
+        if not self._backend_client:
+            logger.error("No backend client configured")
+            return None
+        
+        if not self._backend_client.is_connected:
+            logger.warning("Backend not connected")
+            return None
+        
+        logger.info(
+            "Fetching actions for task",
+            extra={"task_id": task_id}
+        )
+        
+        result = self._backend_client.get_actions(task_id)
+        
+        if result.success:
+            logger.info(
+                "Actions fetched successfully",
+                extra={
+                    "task_id": task_id,
+                    "action_count": result.total_actions,
+                    "action_types": [a.action_type for a in result.actions]
+                }
+            )
+            
+            # Log each action (for debugging/tracing)
+            for action in result.actions:
+                logger.info(
+                    "Action received",
+                    extra={
+                        "action_id": action.action_id,
+                        "action_type": action.action_type,
+                        "description": action.description,
+                        "risk_level": action.risk_level,
+                        "has_parameters": bool(action.parameters)
+                    }
+                )
+        else:
+            logger.warning(
+                "Failed to fetch actions",
+                extra={"task_id": task_id, "error": result.error}
+            )
+        
+        return result
+    
+    def process_command(self, input_text: str) -> dict:
+        """
+        Full command processing flow: send command and fetch actions.
+        
+        This is a convenience method that combines send_command and fetch_actions.
+        
+        FLOW:
+        1. Send command to backend
+        2. If successful, fetch actions
+        3. Return full result with actions
+        
+        NOTE: No actions are executed.
+        
+        Args:
+            input_text: User's natural language command
+            
+        Returns:
+            Dict with task_id, status, actions, and any errors
+        """
+        result = {
+            "success": False,
+            "task_id": None,
+            "status": None,
+            "actions": [],
+            "error": None
+        }
+        
+        # Step 1: Send command
+        task_result = self.send_command(input_text)
+        
+        if not task_result or not task_result.success:
+            result["error"] = task_result.error if task_result else "Failed to send command"
+            return result
+        
+        result["task_id"] = task_result.task_id
+        result["status"] = task_result.status
+        
+        # Step 2: Fetch actions
+        actions_result = self.fetch_actions(task_result.task_id)
+        
+        if not actions_result or not actions_result.success:
+            result["error"] = actions_result.error if actions_result else "Failed to fetch actions"
+            # Still return partial success - we have task_id
+            result["success"] = True  # Task was created
+            return result
+        
+        # Full success
+        result["success"] = True
+        result["actions"] = [
+            {
+                "action_id": a.action_id,
+                "action_type": a.action_type,
+                "parameters": a.parameters,
+                "description": a.description,
+                "risk_level": a.risk_level
+            }
+            for a in actions_result.actions
+        ]
+        
+        logger.info(
+            "Command processed successfully",
+            extra={
+                "task_id": result["task_id"],
+                "action_count": len(result["actions"])
+            }
+        )
+        
+        return result
+    
+    @property
+    def backend_connected(self) -> bool:
+        """Check if backend is connected."""
+        return self._backend_client and self._backend_client.is_connected
 
 
 def main():
@@ -306,10 +1116,18 @@ def main():
     
     logger.info("=" * 60)
     logger.info("SAARTHI Local Executor Starting")
+    logger.info("Voice Command is PRIMARY interaction method")
     logger.info("=" * 60)
     
-    # Create and start executor
-    executor = SaarthiExecutor(use_mock_cloud=True)
+    # Create executor with REAL backend integration and VOICE enabled
+    # use_mock_cloud=False disables legacy mock
+    # use_real_backend=True enables HTTP client to localhost:8000
+    # enable_voice=True enables push-to-talk voice input
+    executor = SaarthiExecutor(
+        use_mock_cloud=False, 
+        use_real_backend=True,
+        enable_voice=True,
+    )
     
     try:
         executor.start()

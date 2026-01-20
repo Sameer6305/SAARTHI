@@ -220,12 +220,18 @@ class LocalWhisperSTT:
                             error[0] = "Model unloaded during transcription"
                             return
                         
-                        # Using transcribe with word timestamps for confidence
+                        # Using transcribe with optimized settings
                         transcription = self._model.transcribe(
                             audio_data,
-                            language="en",  # Can be None for auto-detect
-                            fp16=False,     # CPU compatibility
+                            language="en",          # Force English for accuracy
+                            fp16=False,             # CPU compatibility
                             verbose=False,
+                            task="transcribe",      # Not translate
+                            temperature=0.0,        # Deterministic output
+                            best_of=5,              # More candidates for accuracy
+                            beam_size=5,            # Better beam search
+                            condition_on_previous_text=False,  # Don't hallucinate
+                            initial_prompt="Voice command: ",  # Hint it's a command
                         )
                     
                     result[0] = transcription

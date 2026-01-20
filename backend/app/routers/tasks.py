@@ -8,8 +8,7 @@ API endpoints for task management:
 - GET /status/{task_id} - Get task status
 - POST /task/{task_id}/confirm - Confirm pending task
 - POST /task/{task_id}/reject - Reject pending task
-- GET /task/{task_id}/plan - Get execution plan
-"""
+- GET /task/{task_id}/plan - Get execution plan- GET /task/{task_id}/actions - Get executable actions for local client"""
 
 from typing import Optional
 from uuid import uuid4
@@ -17,8 +16,10 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, status
 
 from app.logging_config import get_logger
+from app.models.actions import ActionResponse
 from app.models.requests import TaskRequest, VoiceRequest
 from app.models.responses import ErrorResponse, StatusResponse, TaskResponse
+from app.services.action_converter import get_action_conversion_service
 from app.services.task_service import get_task_service
 
 router = APIRouter(prefix="/api/v1", tags=["Tasks"])
@@ -378,3 +379,76 @@ async def update_execution_status(
         )
     
     return status_response
+
+
+@router.get(
+    "/task/{task_id}/actions",
+    response_model=ActionResponse,
+    summary="Get Executable Actions",
+    description="Get executable actions for the local client (executor format).",
+    responses={
+        200: {"description": "Actions retrieved"},
+        404: {"model": ErrorResponse, "description": "Task not found"},
+        409: {"model": ErrorResponse, "description": "Actions not ready"},
+    },
+)
+async def get_task_actions(task_id: str) -> ActionResponse:
+    """
+    Get executable actions for a task.
+    
+    This endpoint converts the internal plan into the exact format
+    expected by the local executor client:
+    - action_id, action_type, parameters, signature
+    - Only returns allowlisted action types
+    - Includes cryptographic signature for verification
+    
+    SECURITY:
+    - Only returns actions for READY_FOR_EXECUTION tasks
+    - Actions have 5-minute expiry
+    - Signatures prevent tampering
+    """
+    logger.info("actions_request", task_id=task_id)
+    
+    task_service = get_task_service()
+    
+    # First check status
+    status_response = await task_service.get_task_status(task_id)
+    if status_response is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    
+    if not status_response.ready_for_execution:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Actions not ready (current status: {status_response.status})",
+        )
+    
+    # Get the task's plan and intent
+    plan = await task_service.get_plan(task_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plan not found for task {task_id}",
+        )
+    
+    # Get intent for parameter extraction
+    intent = await task_service.get_intent(task_id)
+    
+    # Convert plan to executable actions
+    converter = get_action_conversion_service()
+    action_response = converter.convert_plan_to_actions(
+        plan=plan,
+        intent_summary=intent.intent_summary if intent else plan.intent_summary,
+        detected_entities=intent.detected_entities if intent else [],
+        target_url=intent.target_url if intent else None,
+    )
+    
+    logger.info(
+        "actions_generated",
+        task_id=task_id,
+        action_count=action_response.total_actions,
+    )
+    
+    return action_response

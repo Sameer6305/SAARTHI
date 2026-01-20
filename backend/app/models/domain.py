@@ -91,6 +91,12 @@ class IntentAnalysis(BaseModel):
         description="Abstracted entities detected (e.g., 'document_folder', not actual path).",
     )
     
+    # Specific parameters extracted for action execution
+    target_url: Optional[str] = Field(
+        default=None,
+        description="Target URL for browser actions (safe URLs only).",
+    )
+    
     requires_tools: list[str] = Field(
         default_factory=list,
         description="Tool categories likely needed.",

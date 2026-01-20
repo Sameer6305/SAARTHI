@@ -36,14 +36,17 @@ class IntentAnalyzer:
     
     # Intent category patterns
     INTENT_PATTERNS: dict[str, list[str]] = {
-        "file_operation": [
-            r"\b(open|close|read|write|delete|move|copy|find|search|folder|file|document)\b",
-        ],
-        "app_control": [
-            r"\b(launch|start|run|open|close|quit|exit|switch|app|application|program)\b",
-        ],
         "browser_action": [
             r"\b(browser|chrome|firefox|edge|safari|web|website|url|search|google)\b",
+            r"\b(youtube|github|linkedin|twitter|facebook|reddit|amazon|netflix|spotify)\b",
+            r"\bhttps?://",
+            r"\b\w+\.(com|org|net|io|dev|app)\b",
+        ],
+        "file_operation": [
+            r"\b(read|write|delete|move|copy|find|folder|file|document|directory)\b",
+        ],
+        "app_control": [
+            r"\b(launch|start|run|close|quit|exit|switch|application|program)\b",
         ],
         "system_operation": [
             r"\b(shutdown|restart|sleep|hibernate|settings|control panel|system)\b",
@@ -52,7 +55,7 @@ class IntentAnalyzer:
             r"\b(email|mail|message|send|compose|reply|slack|teams|discord)\b",
         ],
         "media_control": [
-            r"\b(play|pause|stop|music|video|youtube|spotify|volume|mute)\b",
+            r"\b(play|pause|stop|music|video|volume|mute|next|previous)\b",
         ],
         "information_request": [
             r"\b(what|how|why|when|where|tell me|explain|show me)\b",
@@ -129,6 +132,11 @@ class IntentAnalyzer:
         # Detect abstracted entities
         entities = self._detect_entities(normalized)
         
+        # Extract target URL for browser actions
+        target_url = None
+        if category == "browser_action":
+            target_url = self._extract_target_url(normalized)
+        
         # Determine required tools
         required_tools = self.TOOL_MAPPING.get(category, [])
         
@@ -145,6 +153,7 @@ class IntentAnalyzer:
             intent_summary=summary,
             confidence_score=confidence,
             detected_entities=entities,
+            target_url=target_url,
             requires_tools=required_tools,
             estimated_risk=risk,
             clarification_needed=clarification_needed,
@@ -156,6 +165,7 @@ class IntentAnalyzer:
             category=category,
             confidence=confidence,
             risk=risk.value,
+            target_url=target_url,
             requires_clarification=clarification_needed,
         )
         
@@ -309,11 +319,71 @@ class IntentAnalyzer:
         # That's handled at the confirmation stage
         
         return len(questions) > 0, questions[:3]  # Limit to 3 questions
+    
+    def _extract_target_url(self, text: str) -> Optional[str]:
+        """
+        Extract target URL from browser intent.
+        
+        SECURITY:
+        - Only returns safe, known URLs
+        - Maps common site names to their official URLs
+        - Does NOT return arbitrary user-provided URLs
+        """
+        # Mapping of known safe sites
+        site_map = {
+            "youtube": "https://www.youtube.com",
+            "google": "https://www.google.com",
+            "gmail": "https://mail.google.com",
+            "github": "https://github.com",
+            "twitter": "https://twitter.com",
+            "x.com": "https://x.com",
+            "facebook": "https://www.facebook.com",
+            "linkedin": "https://www.linkedin.com",
+            "reddit": "https://www.reddit.com",
+            "stackoverflow": "https://stackoverflow.com",
+            "stack overflow": "https://stackoverflow.com",
+            "amazon": "https://www.amazon.com",
+            "netflix": "https://www.netflix.com",
+            "spotify": "https://open.spotify.com",
+            "wikipedia": "https://www.wikipedia.org",
+            "instagram": "https://www.instagram.com",
+            "whatsapp": "https://web.whatsapp.com",
+            "outlook": "https://outlook.live.com",
+            "drive": "https://drive.google.com",
+            "google drive": "https://drive.google.com",
+            "docs": "https://docs.google.com",
+            "google docs": "https://docs.google.com",
+            "sheets": "https://sheets.google.com",
+            "google sheets": "https://sheets.google.com",
+            "calendar": "https://calendar.google.com",
+            "google calendar": "https://calendar.google.com",
+            "maps": "https://maps.google.com",
+            "google maps": "https://maps.google.com",
+            "bing": "https://www.bing.com",
+            "chatgpt": "https://chat.openai.com",
+            "openai": "https://chat.openai.com",
+            "claude": "https://claude.ai",
+            "anthropic": "https://claude.ai",
+        }
+        
+        # Check for known sites (case-insensitive)
+        for site_name, url in site_map.items():
+            if site_name in text:
+                return url
+        
+        # Check for explicit URLs in text (only https)
+        url_pattern = r'https://[^\s<>"{}|\\^`\[\]]+'
+        matches = re.findall(url_pattern, text)
+        if matches:
+            # Return first HTTPS URL found
+            return matches[0]
+        
+        # No safe URL found
+        return None
 
 
 # Singleton instance
 _intent_analyzer: Optional[IntentAnalyzer] = None
-
 
 def get_intent_analyzer() -> IntentAnalyzer:
     """Get the singleton intent analyzer instance."""

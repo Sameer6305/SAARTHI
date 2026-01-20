@@ -11,18 +11,33 @@ Orchestrates the complete task lifecycle:
 This is the primary service that coordinates other services.
 """
 
+import time
 from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
 from app.config import get_settings
 from app.logging_config import get_logger
-from app.models.domain import Plan, TaskState, TaskStatus
+from app.models.domain import IntentAnalysis, Plan, TaskState, TaskStatus
 from app.models.memory import MemoryEntryType
 from app.models.responses import PlanStep, StatusResponse, TaskResponse
 from app.services.intent_analyzer import get_intent_analyzer
 from app.services.memory_service import get_memory_service
 from app.services.planner_service import get_planner_service
+from app.services.error_handling import (
+    DEFAULT_TIMEOUTS,
+    InputValidator,
+    IntentValidationResult,
+    PlanningTimeoutError,
+    SafeError,
+    create_planning_failed_error,
+    create_service_error,
+    create_timeout_error,
+    get_input_validator,
+    validate_intent_confidence,
+    validate_intent_is_actionable,
+    with_timeout,
+)
 
 logger = get_logger("task_service")
 settings = get_settings()
@@ -36,7 +51,19 @@ class TaskService:
     - Central coordinator for Planner-Executor pattern
     - Maintains task state in memory
     - No execution logic (execution happens on local client)
+    
+    ERROR HANDLING:
+    - Hard timeouts on all planning phases
+    - Input validation before processing
+    - Intent validation before planning
+    - No partial plans returned
+    - All failures logged and visible
     """
+    
+    # Timeout configuration
+    PLANNING_TIMEOUT_SECONDS = 15.0  # Hard cap for entire planning
+    INTENT_TIMEOUT_SECONDS = 5.0     # Intent analysis timeout
+    PLAN_GEN_TIMEOUT_SECONDS = 10.0  # Plan generation timeout
     
     def __init__(self) -> None:
         """Initialize the task service."""
@@ -47,8 +74,13 @@ class TaskService:
         self._intent_analyzer = get_intent_analyzer()
         self._planner = get_planner_service()
         self._memory = get_memory_service()
+        self._input_validator = get_input_validator()
         
-        logger.info("task_service_initialized")
+        logger.info(
+            "task_service_initialized",
+            planning_timeout=self.PLANNING_TIMEOUT_SECONDS,
+            intent_timeout=self.INTENT_TIMEOUT_SECONDS,
+        )
     
     async def create_task(
         self,
@@ -60,17 +92,26 @@ class TaskService:
         Create a new task from user input.
         
         This method:
-        1. Creates task state
-        2. Analyzes intent (abstracted)
-        3. Generates execution plan
-        4. Returns task info to caller
+        1. Validates input (rejects invalid/ambiguous)
+        2. Creates task state
+        3. Analyzes intent with TIMEOUT
+        4. Validates intent (rejects low confidence/unsupported)
+        5. Generates execution plan with TIMEOUT
+        6. Returns task info to caller
         
         SECURITY:
         - input_text is NOT stored (only abstracted intent)
         - All processing is on abstracted data
+        
+        ERROR HANDLING:
+        - Input validation rejects empty/gibberish/malicious input
+        - Intent validation rejects ambiguous/unsupported requests
+        - Hard timeouts prevent runaway processing
+        - All failures return clean error responses
         """
         task_id = f"task_{uuid4().hex[:16]}"
         effective_session_id = session_id or f"sess_{uuid4().hex[:16]}"
+        planning_start_time = time.monotonic()
         
         logger.info(
             "task_creation_started",
@@ -78,6 +119,30 @@ class TaskService:
             session_id=effective_session_id,
             has_context=context is not None,
         )
+        
+        # =====================================================================
+        # PHASE 0: INPUT VALIDATION (Before creating task state)
+        # =====================================================================
+        validation_result = self._input_validator.validate(input_text)
+        
+        if not validation_result.is_valid:
+            logger.warning(
+                "input_validation_failed",
+                task_id=task_id,
+                reason=validation_result.rejection_reason,
+            )
+            
+            error = validation_result.error
+            return TaskResponse(
+                task_id=task_id,
+                status=TaskStatus.FAILED.value,
+                message=error.user_message if error else "Invalid input",
+                created_at=datetime.utcnow(),
+                error_code=error.internal_code if error else "VALIDATION_FAILED",
+            )
+        
+        # Use sanitized input
+        sanitized_input = validation_result.sanitized_input or input_text
         
         # Create initial task state
         task = TaskState(
@@ -89,11 +154,78 @@ class TaskService:
         self._tasks[task_id] = task
         
         try:
-            # Phase 1: Intent Analysis
+            # =================================================================
+            # PHASE 1: INTENT ANALYSIS (With Timeout)
+            # =================================================================
             task.update_status(TaskStatus.ANALYZING, "Starting intent analysis")
             
-            intent = self._intent_analyzer.analyze(input_text)
+            try:
+                intent = self._analyze_intent_with_timeout(sanitized_input)
+            except PlanningTimeoutError as e:
+                logger.error(
+                    "intent_analysis_timeout",
+                    task_id=task_id,
+                    timeout=e.timeout_seconds,
+                    elapsed=e.elapsed_seconds,
+                )
+                task.update_status(TaskStatus.FAILED, "Intent analysis timed out")
+                error = create_timeout_error("intent_analysis", e.timeout_seconds, e.elapsed_seconds)
+                return TaskResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    message=error.user_message,
+                    created_at=task.created_at,
+                    error_code=error.internal_code,
+                )
+            
             task.intent = intent
+            
+            # =================================================================
+            # PHASE 1b: INTENT VALIDATION
+            # =================================================================
+            # Check confidence
+            confidence_check = validate_intent_confidence(
+                intent.confidence_score,
+                intent.intent_category,
+            )
+            if not confidence_check.is_valid:
+                logger.warning(
+                    "intent_low_confidence",
+                    task_id=task_id,
+                    confidence=intent.confidence_score,
+                    reason=confidence_check.rejection_reason,
+                )
+                task.update_status(TaskStatus.FAILED, "Intent unclear")
+                error = confidence_check.error
+                return TaskResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    message=error.user_message if error else "Intent unclear",
+                    created_at=task.created_at,
+                    error_code=error.internal_code if error else "INTENT_UNCLEAR",
+                )
+            
+            # Check if actionable
+            actionable_check = validate_intent_is_actionable(
+                intent.intent_category,
+                intent.requires_tools,
+            )
+            if not actionable_check.is_valid:
+                logger.info(
+                    "intent_not_actionable",
+                    task_id=task_id,
+                    category=intent.intent_category,
+                    reason=actionable_check.rejection_reason,
+                )
+                task.update_status(TaskStatus.FAILED, "Request not actionable")
+                error = actionable_check.error
+                return TaskResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    message=error.user_message if error else "Cannot act on this request",
+                    created_at=task.created_at,
+                    error_code=error.internal_code if error else "NOT_ACTIONABLE",
+                )
             
             # Store abstracted intent in STM (NOT raw input)
             self._memory.create_stm_entry(
@@ -123,10 +255,51 @@ class TaskService:
                     intent_summary=intent.intent_summary,
                 )
             
-            # Phase 2: Plan Generation
+            # =================================================================
+            # PHASE 2: PLAN GENERATION (With Timeout)
+            # =================================================================
+            # Check total planning time budget
+            elapsed_so_far = time.monotonic() - planning_start_time
+            remaining_time = self.PLANNING_TIMEOUT_SECONDS - elapsed_so_far
+            
+            if remaining_time <= 0:
+                logger.error(
+                    "planning_total_timeout",
+                    task_id=task_id,
+                    elapsed=elapsed_so_far,
+                    budget=self.PLANNING_TIMEOUT_SECONDS,
+                )
+                task.update_status(TaskStatus.FAILED, "Planning timed out")
+                error = create_timeout_error("planning", self.PLANNING_TIMEOUT_SECONDS, elapsed_so_far)
+                return TaskResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    message=error.user_message,
+                    created_at=task.created_at,
+                    error_code=error.internal_code,
+                )
+            
             task.update_status(TaskStatus.PLANNING, "Generating execution plan")
             
-            plan = self._planner.generate_plan(task_id, intent)
+            try:
+                plan = self._generate_plan_with_timeout(task_id, intent)
+            except PlanningTimeoutError as e:
+                logger.error(
+                    "plan_generation_timeout",
+                    task_id=task_id,
+                    timeout=e.timeout_seconds,
+                    elapsed=e.elapsed_seconds,
+                )
+                task.update_status(TaskStatus.PLANNING_FAILED, "Plan generation timed out")
+                error = create_timeout_error("plan_generation", e.timeout_seconds, e.elapsed_seconds)
+                return TaskResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    message=error.user_message,
+                    created_at=task.created_at,
+                    error_code=error.internal_code,
+                    intent_summary=intent.intent_summary,
+                )
             
             # Validate plan
             is_valid, issues = self._planner.validate_plan(plan)
@@ -138,12 +311,14 @@ class TaskService:
                 )
                 task.update_status(TaskStatus.PLANNING_FAILED, f"Plan validation failed: {issues}")
                 task.failure_reason = f"Plan validation failed: {issues}"
+                error = create_planning_failed_error(str(issues))
                 return TaskResponse(
                     task_id=task_id,
                     status=task.status.value,
-                    message="Planning failed due to validation errors",
+                    message=error.user_message,
                     created_at=task.created_at,
                     intent_summary=intent.intent_summary,
+                    error_code=error.internal_code,
                 )
             
             task.plan = plan
@@ -203,12 +378,44 @@ class TaskService:
             task.update_status(TaskStatus.FAILED, f"Task creation failed: {str(e)}")
             task.failure_reason = str(e)
             
+            # Create safe error for user
+            error = create_service_error(str(e))
+            
             return TaskResponse(
                 task_id=task_id,
                 status=task.status.value,
-                message="Task creation failed",
+                message=error.user_message,
                 created_at=task.created_at,
+                error_code=error.internal_code,
             )
+    
+    # =========================================================================
+    # TIMEOUT-WRAPPED METHODS
+    # =========================================================================
+    
+    @with_timeout(timeout_seconds=5.0, phase_name="intent_analysis")
+    def _analyze_intent_with_timeout(self, input_text: str) -> IntentAnalysis:
+        """
+        Analyze intent with timeout protection.
+        
+        TIMEOUT: 5 seconds
+        ON TIMEOUT: Raises PlanningTimeoutError
+        """
+        return self._intent_analyzer.analyze(input_text)
+    
+    @with_timeout(timeout_seconds=10.0, phase_name="plan_generation")
+    def _generate_plan_with_timeout(
+        self,
+        task_id: str,
+        intent: IntentAnalysis,
+    ) -> Plan:
+        """
+        Generate plan with timeout protection.
+        
+        TIMEOUT: 10 seconds
+        ON TIMEOUT: Raises PlanningTimeoutError
+        """
+        return self._planner.generate_plan(task_id, intent)
     
     async def get_task_status(self, task_id: str) -> Optional[StatusResponse]:
         """
@@ -330,6 +537,19 @@ class TaskService:
             return None
         
         return task.plan
+    
+    async def get_intent(self, task_id: str) -> Optional[IntentAnalysis]:
+        """
+        Get the analyzed intent for a task.
+        
+        This is used for parameter extraction when converting to actions.
+        """
+        task = self._tasks.get(task_id)
+        
+        if task is None:
+            return None
+        
+        return task.intent
     
     async def update_execution_status(
         self,
