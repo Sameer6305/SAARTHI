@@ -88,13 +88,16 @@ class LocalWhisperSTT:
         Initialize Whisper STT.
         
         Args:
-            model_name: Whisper model size
+            model_name: Whisper model size (can be WhisperModel enum or string)
             model_path: Path to model (None = use default cache)
             device: Device to run on ("cpu" recommended for privacy)
             timeout_seconds: Max time for transcription
             min_confidence: Below this, reject as NO_SPEECH
             ambiguous_confidence: Below this, mark as ambiguous
         """
+        # Handle string model names (from JSON config)
+        if isinstance(model_name, str):
+            model_name = WhisperModel(model_name)
         self._model_name = model_name
         self._model_path = model_path
         self._device = device
@@ -220,18 +223,18 @@ class LocalWhisperSTT:
                             error[0] = "Model unloaded during transcription"
                             return
                         
-                        # Using transcribe with optimized settings
+                        # Using transcribe with SPEED-optimized settings
                         transcription = self._model.transcribe(
                             audio_data,
-                            language="en",          # Force English for accuracy
+                            language="en",          # Force English (no detection)
                             fp16=False,             # CPU compatibility
                             verbose=False,
-                            task="transcribe",      # Not translate
-                            temperature=0.0,        # Deterministic output
-                            best_of=5,              # More candidates for accuracy
-                            beam_size=5,            # Better beam search
-                            condition_on_previous_text=False,  # Don't hallucinate
-                            initial_prompt="Voice command: ",  # Hint it's a command
+                            task="transcribe",
+                            temperature=0.0,        # Deterministic (faster)
+                            best_of=1,              # Faster - single candidate
+                            beam_size=1,            # Faster - greedy decoding
+                            condition_on_previous_text=False,
+                            initial_prompt=None,    # No prompt overhead
                         )
                     
                     result[0] = transcription

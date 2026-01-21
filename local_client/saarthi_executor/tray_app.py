@@ -15,9 +15,15 @@ VOICE INPUT:
 - Push-to-talk ONLY (no background listening)
 - Voice is treated as UNTRUSTED input (same as text)
 - Goes through same permission flow
+
+THREADING MODEL:
+- Tray icon runs in BACKGROUND thread (run_detached)
+- Main thread stays free for Tkinter dialogs
+- Callbacks schedule work to main thread via queue
 """
 
 import logging
+import queue
 import threading
 import time
 from typing import Optional, Callable
@@ -30,6 +36,32 @@ from PIL import Image, ImageDraw
 from saarthi_executor.state_machine import StateMachine, ExecutorState
 
 logger = logging.getLogger(__name__)
+
+
+# Dialog request types for the main thread queue
+class DialogRequest:
+    """Base class for dialog requests."""
+    pass
+
+
+class CommandDialogRequest(DialogRequest):
+    """Request to show command dialog."""
+    pass
+
+
+class VoiceDialogRequest(DialogRequest):
+    """Request to show voice command dialog."""
+    pass
+
+
+class VoiceSettingsRequest(DialogRequest):
+    """Request to show voice settings dialog."""
+    pass
+
+
+class ExitRequest(DialogRequest):
+    """Request to exit the application."""
+    pass
 
 
 class TrayIcon:
@@ -85,8 +117,16 @@ class TrayIcon:
         self._running = False
         self._is_recording = False  # Track recording state
         
+        # Queue for scheduling dialog requests to main thread
+        self._dialog_queue: queue.Queue = queue.Queue()
+        
         # Register for state changes
         state_machine.register_state_change_callback(self._on_state_change)
+    
+    @property
+    def dialog_queue(self) -> queue.Queue:
+        """Get the dialog request queue (for main thread to consume)."""
+        return self._dialog_queue
     
     def _create_icon_image(self, color: str) -> Image.Image:
         """Create a simple circular icon with the given color."""
@@ -109,9 +149,9 @@ class TrayIcon:
         """Create the context menu."""
         current_state = self._state_machine.current_state
         
-        # Check voice availability
-        voice_enabled = self._is_voice_enabled() if self._is_voice_enabled else False
-        voice_label = "🎤 Voice Command" if voice_enabled else "🎤 Voice Command (Disabled)"
+        # Voice is always available with the subprocess-based dialog
+        voice_label = "🎤 Voice Command"
+        voice_enabled = self._on_voice_command is not None
         
         # Build menu items
         menu_items = [
@@ -128,7 +168,7 @@ class TrayIcon:
             pystray.MenuItem(
                 voice_label,
                 self._on_voice_command_click,
-                enabled=self._on_voice_command is not None and voice_enabled,
+                enabled=voice_enabled,
                 default=True,  # Make it the default (bold) - PRIMARY entry point
             ),
             
@@ -197,26 +237,16 @@ class TrayIcon:
         """
         Handle "Send Command" menu click.
         
-        Opens the command input dialog in a separate thread
-        to avoid blocking the tray icon event loop.
+        Puts a request in the dialog queue for the main thread to process.
         """
         logger.info("Send Command clicked from tray menu")
-        
-        if self._on_send_command:
-            # Run in thread to avoid blocking tray
-            threading.Thread(
-                target=self._on_send_command,
-                daemon=True,
-                name="CommandDialogThread",
-            ).start()
-        else:
-            logger.warning("No send_command callback registered")
+        self._dialog_queue.put(CommandDialogRequest())
     
     def _on_voice_command_click(self, icon, item) -> None:
         """
         Handle "Voice Command" menu click.
         
-        Opens the push-to-talk voice input dialog.
+        Puts a request in the dialog queue for the main thread to process.
         Voice input is treated as UNTRUSTED - same as text input.
         
         SECURITY:
@@ -225,16 +255,7 @@ class TrayIcon:
         - Same allowlist, same dialogs, same logging
         """
         logger.info("Voice Command clicked from tray menu (PRIMARY)")
-        
-        if self._on_voice_command:
-            # Run in thread to avoid blocking tray
-            threading.Thread(
-                target=self._on_voice_command,
-                daemon=True,
-                name="VoiceCommandThread",
-            ).start()
-        else:
-            logger.warning("No voice_command callback registered")
+        self._dialog_queue.put(VoiceDialogRequest())
     
     def _on_voice_settings_click(self, icon, item) -> None:
         """Handle "Voice Settings" menu click."""
@@ -276,10 +297,14 @@ class TrayIcon:
         """Handle exit menu click."""
         logger.info("Exit requested from tray menu")
         self.stop()
-        self._on_exit()
+        self._dialog_queue.put(ExitRequest())
     
     def start(self) -> None:
-        """Start the tray icon."""
+        """
+        Start the tray icon (BLOCKING - runs in main thread).
+        
+        Use start_detached() to run in background instead.
+        """
         color = self.STATE_COLORS.get(
             self._state_machine.current_state, 
             "#808080"
@@ -293,10 +318,35 @@ class TrayIcon:
         )
         
         self._running = True
-        logger.info("Tray icon started")
+        logger.info("Tray icon started (blocking)")
         
         # This blocks - run in main thread
         self._icon.run()
+    
+    def start_detached(self) -> None:
+        """
+        Start the tray icon in a BACKGROUND thread.
+        
+        This is the preferred method - keeps main thread free for Tkinter dialogs.
+        After calling this, use dialog_queue to process dialog requests on main thread.
+        """
+        color = self.STATE_COLORS.get(
+            self._state_machine.current_state, 
+            "#808080"
+        )
+        
+        self._icon = pystray.Icon(
+            name="SAARTHI",
+            icon=self._create_icon_image(color),
+            title=f"SAARTHI - {self._state_machine.current_state.name}",
+            menu=self._get_menu(),
+        )
+        
+        self._running = True
+        logger.info("Tray icon started (detached/background)")
+        
+        # Run in background thread - main thread stays free for dialogs
+        self._icon.run_detached()
     
     def stop(self) -> None:
         """Stop the tray icon."""

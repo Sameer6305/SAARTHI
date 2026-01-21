@@ -137,9 +137,14 @@ class VoicePipeline:
                 on_state_change=self._on_capture_state_change,
             )
             
-            # STT
+            # STT - convert string to enum if needed
+            whisper_model = self._config.whisper_model
+            if isinstance(whisper_model, str):
+                from saarthi_executor.voice.config import WhisperModel
+                whisper_model = WhisperModel(whisper_model)
+            
             self._stt = LocalWhisperSTT(
-                model_name=self._config.whisper_model,
+                model_name=whisper_model,
                 model_path=self._config.whisper_model_path,
                 device="cpu",  # CPU for privacy/compatibility
                 timeout_seconds=self._config.stt_timeout_seconds,
@@ -147,13 +152,22 @@ class VoicePipeline:
                 ambiguous_confidence=self._config.ambiguous_confidence,
             )
             
-            # TTS
-            self._tts = create_tts_engine(
-                self._config.tts_engine,
-                voice_name=self._config.tts_voice_name,
-                rate=self._config.tts_rate,
-                volume=self._config.tts_volume,
-            )
+            # TTS - optional, non-fatal if it fails
+            try:
+                tts_engine = self._config.tts_engine
+                if isinstance(tts_engine, str):
+                    from saarthi_executor.voice.config import TTSEngine
+                    tts_engine = TTSEngine(tts_engine)
+                
+                self._tts = create_tts_engine(
+                    tts_engine,
+                    voice_name=self._config.tts_voice_name,
+                    rate=self._config.tts_rate,
+                    volume=self._config.tts_volume,
+                )
+            except Exception as e:
+                logger.warning(f"TTS initialization failed (non-fatal): {e}")
+                self._tts = None  # TTS is optional
             
             self._set_state(VoicePipelineState.READY)
             logger.info("Voice pipeline initialized")
@@ -247,7 +261,12 @@ class VoicePipeline:
             logger.warning("Voice not enabled")
             return False
         
-        if not self._state == VoicePipelineState.READY:
+        # If stuck in RECORDING or TRANSCRIBING, force reset first
+        if self._state in (VoicePipelineState.RECORDING, VoicePipelineState.TRANSCRIBING):
+            logger.warning(f"Stuck in state {self._state}, forcing reset before starting")
+            self.force_reset()
+        
+        if self._state != VoicePipelineState.READY:
             logger.warning(f"Cannot start recording in state: {self._state}")
             return False
         
@@ -273,7 +292,8 @@ class VoicePipeline:
         Called when user RELEASES the talk button.
         Returns transcribed text (or error).
         """
-        if self._state != VoicePipelineState.RECORDING:
+        # Allow stopping from RECORDING or TRANSCRIBING states (in case of stuck state)
+        if self._state not in (VoicePipelineState.RECORDING, VoicePipelineState.TRANSCRIBING):
             return VoiceInputResult(
                 success=False,
                 text="",
@@ -283,6 +303,7 @@ class VoicePipeline:
             )
         
         if not self._capture:
+            self._set_state(VoicePipelineState.READY)
             return VoiceInputResult(
                 success=False,
                 text="",
@@ -372,6 +393,28 @@ class VoicePipeline:
         
         self._set_state(VoicePipelineState.READY)
         logger.info("Recording cancelled")
+    
+    def force_reset(self) -> None:
+        """
+        Force reset the pipeline state.
+        
+        Use when pipeline is stuck in an unexpected state.
+        Cancels any recording and resets to READY.
+        """
+        logger.warning("Force resetting voice pipeline state")
+        
+        # Try to cancel any recording
+        if self._capture:
+            try:
+                self._capture.cancel_recording()
+            except Exception as e:
+                logger.error(f"Error cancelling recording during reset: {e}")
+        
+        # Reset to READY if enabled, otherwise DISABLED
+        if self._config.enabled:
+            self._set_state(VoicePipelineState.READY)
+        else:
+            self._set_state(VoicePipelineState.DISABLED)
     
     def speak(self, text: str) -> SpeakResult:
         """

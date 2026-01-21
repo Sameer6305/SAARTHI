@@ -48,7 +48,14 @@ from saarthi_executor.backend_client import (
     ActionsResult,
     ConnectionState,
 )
-from saarthi_executor.tray_app import TrayIcon
+from saarthi_executor.tray_app import (
+    TrayIcon,
+    DialogRequest,
+    CommandDialogRequest,
+    VoiceDialogRequest,
+    VoiceSettingsRequest,
+    ExitRequest,
+)
 from saarthi_executor.command_dialog import (
     CommandDialog,
     DialogResult,
@@ -64,6 +71,9 @@ from saarthi_executor.voice_command_dialog import (
 from saarthi_executor.voice.integration import VoiceIntegration
 from saarthi_executor.voice.config import VoiceConfig
 from saarthi_executor.logging_config import setup_logging, security_logger
+
+# NEW: Integrated assistant with conversational loop, student tools, TTS
+from saarthi_executor.integrated_assistant import IntegratedAssistant, create_assistant
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +158,12 @@ class SaarthiExecutor:
             )
             logger.info("Voice integration created")
         
+        # ═══════════════════════════════════════════════════════════════════
+        # INTEGRATED ASSISTANT (NEW)
+        # Handles: Conversational loop, Student tools, TTS, Safe actions
+        # ═══════════════════════════════════════════════════════════════════
+        self._assistant: Optional[IntegratedAssistant] = None
+        
         # Tray application
         self._tray: Optional[TrayIcon] = None
         
@@ -165,7 +181,16 @@ class SaarthiExecutor:
         })
     
     def start(self) -> None:
-        """Start the executor application."""
+        """
+        Start the executor application.
+        
+        THREADING MODEL:
+        - Main thread: Runs dialog queue loop (handles Tkinter dialogs)
+        - Background thread 1: Tray icon (via run_detached)
+        - Background thread 2: Action listener loop
+        
+        This keeps main thread free for Tkinter which requires it.
+        """
         logger.info("Starting SAARTHI Executor")
         
         self._running = True
@@ -196,6 +221,25 @@ class SaarthiExecutor:
             else:
                 logger.warning("Voice integration failed to initialize")
         
+        # ═══════════════════════════════════════════════════════════════════
+        # INITIALIZE INTEGRATED ASSISTANT
+        # Conversational loop, Student tools, TTS, Safe desktop actions
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            self._assistant = create_assistant(
+                enable_tts=True,  # Local TTS (Windows SAPI/Piper)
+                llm_callback=self._local_llm_callback,  # Optional local LLM
+            )
+            logger.info("Integrated assistant initialized with TTS")
+        except Exception as e:
+            logger.warning(f"Assistant initialization failed (TTS may not work): {e}")
+            # Try without TTS
+            try:
+                self._assistant = create_assistant(enable_tts=False)
+                logger.info("Integrated assistant initialized without TTS")
+            except Exception as e2:
+                logger.error(f"Assistant initialization completely failed: {e2}")
+        
         # Start listener thread
         self._listener_thread = threading.Thread(
             target=self._listener_loop,
@@ -204,7 +248,7 @@ class SaarthiExecutor:
         )
         self._listener_thread.start()
         
-        # Create and start tray icon (blocks)
+        # Create tray icon
         # Voice Command is now the PRIMARY entry point
         self._tray = TrayIcon(
             state_machine=self._state_machine,
@@ -222,12 +266,57 @@ class SaarthiExecutor:
             )
         )
         
+        # Start tray icon in BACKGROUND thread (keeps main thread free)
+        self._tray.start_detached()
+        
         # Start in SLEEP state, user must activate
         logger.info("Executor started - in SLEEP state")
         logger.info("Voice Command is PRIMARY interaction method")
         
-        # This blocks (tray icon main loop)
-        self._tray.start()
+        # Main thread runs the dialog queue loop (for Tkinter)
+        self._run_dialog_queue_loop()
+    
+    def _run_dialog_queue_loop(self) -> None:
+        """
+        Main thread loop that processes dialog requests from the queue.
+        
+        This runs on the MAIN THREAD so Tkinter dialogs work correctly.
+        The tray icon runs in a background thread and puts requests in the queue.
+        """
+        import queue as queue_module
+        
+        logger.info("Dialog queue loop started on main thread")
+        
+        while self._running:
+            try:
+                # Wait for a dialog request (with timeout to check _running)
+                request = self._tray.dialog_queue.get(timeout=0.5)
+                
+                # Process the request
+                if isinstance(request, CommandDialogRequest):
+                    logger.info("Processing command dialog request")
+                    self._show_command_dialog()
+                    
+                elif isinstance(request, VoiceDialogRequest):
+                    logger.info("Processing voice dialog request")
+                    self._show_voice_command_dialog()
+                    
+                elif isinstance(request, VoiceSettingsRequest):
+                    logger.info("Processing voice settings request")
+                    self._show_voice_settings()
+                    
+                elif isinstance(request, ExitRequest):
+                    logger.info("Processing exit request")
+                    self.stop()
+                    break
+                    
+            except queue_module.Empty:
+                # Timeout, loop again to check _running
+                continue
+            except Exception as e:
+                logger.error(f"Error processing dialog request: {e}")
+        
+        logger.info("Dialog queue loop stopped")
     
     def stop(self) -> None:
         """Stop the executor application."""
@@ -239,6 +328,11 @@ class SaarthiExecutor:
         if self._voice_integration:
             self._voice_integration.cleanup()
             logger.info("Voice integration cleaned up")
+        
+        # Clean up integrated assistant
+        if self._assistant:
+            self._assistant.cleanup()
+            logger.info("Integrated assistant cleaned up")
         
         # Disconnect from real backend
         if self._backend_client:
@@ -563,11 +657,12 @@ class SaarthiExecutor:
         Show the command input dialog.
         
         Called when user clicks "Send Command" in tray menu.
-        Opens a modal dialog for text input.
+        Now runs on MAIN THREAD so Tkinter works correctly.
         """
         logger.info("Opening command dialog")
         
         try:
+            # Now running on main thread, Tkinter works directly
             result = show_command_dialog(
                 on_send=self._handle_dialog_send
             )
@@ -594,7 +689,7 @@ class SaarthiExecutor:
         Handle command from dialog - send to backend.
         
         This is the callback passed to the command dialog.
-        It sends the command to the backend and returns the result.
+        Now uses INTEGRATED ASSISTANT first, then falls back to backend.
         
         Args:
             input_text: Validated user input from dialog
@@ -606,6 +701,41 @@ class SaarthiExecutor:
             "Handling dialog send",
             extra={"input_length": len(input_text)}
         )
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # TRY INTEGRATED ASSISTANT FIRST (Fast, local)
+        # ═══════════════════════════════════════════════════════════════════
+        if self._assistant:
+            try:
+                response = self._assistant.process(input_text)
+                
+                # If assistant handled it (action executed or conversation)
+                if response.action_executed or not response.needs_clarification:
+                    logger.info(
+                        "Assistant handled command locally",
+                        extra={"action": response.action_type}
+                    )
+                    
+                    # Show notification
+                    if self._tray and response.text:
+                        self._tray.show_notification(
+                            "SAARTHI" if not response.action_executed else "✓ Done",
+                            response.text[:100],
+                        )
+                    
+                    return DialogResult(
+                        result=CommandResult.SUCCESS,
+                        task_id=f"local_{int(time.time())}",
+                        status="completed",
+                        message=response.text,
+                    )
+                    
+            except Exception as e:
+                logger.warning(f"Assistant failed, falling back to backend: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # FALLBACK TO BACKEND
+        # ═══════════════════════════════════════════════════════════════════
         
         # Check backend connection
         if not self._backend_client:
@@ -669,7 +799,7 @@ class SaarthiExecutor:
         Show the voice command dialog (PRIMARY interaction method).
         
         Called when user clicks "Voice Command" in tray menu.
-        Opens push-to-talk dialog for voice input.
+        Now runs on MAIN THREAD so Tkinter works correctly.
         
         SECURITY:
         - Voice input is treated IDENTICALLY to text input
@@ -700,7 +830,7 @@ class SaarthiExecutor:
                 return
         
         try:
-            # Show voice dialog with callbacks
+            # Now running on main thread, Tkinter works directly
             result = show_voice_command_dialog(
                 on_start_recording=self._voice_start_recording,
                 on_stop_recording=self._voice_stop_recording,
@@ -725,6 +855,14 @@ class SaarthiExecutor:
                     "Voice Dialog Error",
                     f"Failed to open voice dialog: {e}"
                 )
+                
+        except Exception as e:
+            logger.error(f"Error showing voice command dialog: {e}")
+            if self._tray:
+                self._tray.show_notification(
+                    "Voice Dialog Error",
+                    f"Failed to open voice dialog: {e}"
+                )
     
     def _voice_start_recording(self) -> bool:
         """
@@ -737,18 +875,19 @@ class SaarthiExecutor:
         if not self._voice_integration:
             return False
         
-        # Update tray icon to show recording
-        if self._tray:
-            self._tray.set_recording_state(True)
-        
         success = self._voice_integration.start_push_to_talk()
         
         if success:
+            # Only update tray icon if recording actually started
+            if self._tray:
+                self._tray.set_recording_state(True)
+            
             # Log for audit
-            security_logger.info(
-                "Voice recording started",
-                extra={"source": "push_to_talk"}
-            )
+            security_logger.voice_recording_started(source="push_to_talk")
+        else:
+            # Make sure tray shows NOT recording on failure
+            if self._tray:
+                self._tray.set_recording_state(False)
         
         return success
     
@@ -787,10 +926,8 @@ class SaarthiExecutor:
                 }
             )
             
-            security_logger.info(
-                "Voice transcription complete",
-                extra={"text_preview": text[:30] + "..." if len(text) > 30 else text}
-            )
+            text_preview = text[:30] + "..." if len(text) > 30 else text
+            security_logger.voice_transcription_complete(text_preview=text_preview)
             
             return (text, confidence)
         
@@ -831,12 +968,10 @@ class SaarthiExecutor:
         )
         
         # Log for audit - voice input is treated as untrusted
-        security_logger.info(
-            "Voice command submitted",
-            extra={
-                "source": "voice_push_to_talk",
-                "text_preview": text[:50] + "..." if len(text) > 50 else text,
-            }
+        text_preview = text[:50] + "..." if len(text) > 50 else text
+        security_logger.voice_command_submitted(
+            source="voice_push_to_talk",
+            text_preview=text_preview,
         )
         
         # Send through SAME pipeline as text input
@@ -857,7 +992,7 @@ class SaarthiExecutor:
         Handle voice input text from integration callback.
         
         This is an alternative entry point for voice text.
-        Goes through same flow as dialog.
+        Now uses the INTEGRATED ASSISTANT for conversational responses.
         
         Args:
             text: Transcribed text from voice input
@@ -867,7 +1002,38 @@ class SaarthiExecutor:
             extra={"text_length": len(text)}
         )
         
-        # Send through same pipeline
+        # ═══════════════════════════════════════════════════════════════════
+        # USE INTEGRATED ASSISTANT (NEW)
+        # Handles: Pattern matching, Student tools, TTS responses
+        # ═══════════════════════════════════════════════════════════════════
+        if self._assistant:
+            try:
+                response = self._assistant.process(text)
+                
+                logger.info(
+                    "Assistant response",
+                    extra={
+                        "text": response.text[:50] if response.text else "",
+                        "action_executed": response.action_executed,
+                        "needs_clarification": response.needs_clarification,
+                    }
+                )
+                
+                # Show notification with response
+                if self._tray and response.text:
+                    self._tray.show_notification(
+                        "SAARTHI" if not response.action_executed else "✓ Done",
+                        response.text[:100],
+                    )
+                
+                # TTS is handled inside assistant.process()
+                return
+                
+            except Exception as e:
+                logger.error(f"Assistant processing failed: {e}")
+                # Fall through to backend
+        
+        # Fallback: Send through backend pipeline
         result = self.send_command(text)
         
         if result and result.success:
@@ -890,6 +1056,58 @@ class SaarthiExecutor:
                     "Voice Not Available",
                     "Voice features are not enabled"
                 )
+
+    # =========================================================================
+    # LOCAL LLM INTEGRATION (NEW - FREE, LOCAL)
+    # =========================================================================
+    
+    def _local_llm_callback(self, prompt: str) -> str:
+        """
+        Call local LLM (Ollama) for complex understanding.
+        
+        FREE-ONLY STACK:
+        - Uses Ollama running locally
+        - Recommended models: phi3, mistral, llama2
+        - No cloud, no API keys, no cost
+        
+        FALLBACK:
+        - If Ollama not running, returns helpful message
+        
+        Args:
+            prompt: The prompt to send to LLM
+            
+        Returns:
+            LLM response or fallback message
+        """
+        import requests
+        
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "phi3",  # Fast, small model
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": 256,  # Limit response length
+                        "temperature": 0.3,  # More deterministic
+                    },
+                },
+                timeout=10.0,
+            )
+            
+            if response.status_code == 200:
+                return response.json().get("response", "")
+            else:
+                logger.warning(f"Ollama returned status {response.status_code}")
+                
+        except requests.exceptions.ConnectionError:
+            logger.debug("Ollama not running (this is optional)")
+        except Exception as e:
+            logger.warning(f"Local LLM call failed: {e}")
+        
+        # Fallback - no LLM available
+        return ""
 
     # =========================================================================
     # BACKEND INTEGRATION (NEW)

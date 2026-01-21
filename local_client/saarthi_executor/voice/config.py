@@ -39,12 +39,12 @@ class VoiceConfig:
     """
     
     # ==================== MASTER SWITCH ====================
-    # Voice is OFF by default - user must explicitly enable
-    enabled: bool = False
+    # Voice is ON by default since it's the PRIMARY interaction method
+    enabled: bool = True
     
     # ==================== STT SETTINGS ====================
-    # Whisper model (small has best accuracy for commands)
-    whisper_model: WhisperModel = WhisperModel.SMALL
+    # Whisper model (TINY is fastest for voice commands - ~1-2 sec transcription)
+    whisper_model: WhisperModel = WhisperModel.TINY
     
     # Path to Whisper model (None = download on first use)
     whisper_model_path: Optional[Path] = None

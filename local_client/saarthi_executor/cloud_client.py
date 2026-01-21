@@ -55,6 +55,12 @@ class CloudClient:
         """Initialize the cloud client."""
         self.config = config
         self._client: Optional[httpx.Client] = None
+        self._connected = False  # Track actual connection status
+    
+    @property
+    def is_connected(self) -> bool:
+        """Check if connected to cloud."""
+        return self._connected
     
     def connect(self) -> bool:
         """Establish connection to cloud."""
@@ -74,20 +80,24 @@ class CloudClient:
             
             if response.status_code == 200:
                 logger.info("Connected to cloud backend")
+                self._connected = True
                 return True
             else:
                 logger.warning(
                     "Cloud health check failed",
                     extra={"status_code": response.status_code}
                 )
+                self._connected = False
                 return False
                 
         except Exception as e:
             logger.error(f"Failed to connect to cloud: {e}")
+            self._connected = False
             return False
     
     def disconnect(self) -> None:
         """Close connection to cloud."""
+        self._connected = False
         if self._client:
             self._client.close()
             self._client = None
@@ -99,8 +109,8 @@ class CloudClient:
         
         Returns None if no actions pending.
         """
-        if not self._client:
-            logger.warning("Not connected to cloud")
+        if not self._connected or not self._client:
+            # Not connected - silent return (no spam)
             return None
         
         try:

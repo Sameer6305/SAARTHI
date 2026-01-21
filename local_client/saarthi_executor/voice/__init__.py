@@ -44,3 +44,54 @@ VOICE_FORBIDDEN = [
     "silent_recording",
     "audio_telemetry",
 ]
+
+
+# =============================================================================
+# TTS EXPORTS
+# =============================================================================
+
+from .tts_engine import (
+    TTSManager,
+    TTSConfig,
+    TTSEngine,
+    VoiceProfile,
+    AudioEffects,
+    speak,
+    stop_speaking,
+    get_tts,
+)
+
+from .tts_profiles import (
+    ROBOTIC_DEEP,
+    ROBOTIC_LIGHT,
+    NATURAL_DEEP,
+    FAST_RESPONSE,
+    DRAMATIC,
+    DEFAULT_PROFILE,
+    get_profile_for_context,
+    create_config,
+)
+
+__all__ = [
+    # TTS Manager
+    "TTSManager",
+    "TTSConfig",
+    "TTSEngine",
+    "VoiceProfile",
+    "AudioEffects",
+    
+    # TTS convenience
+    "speak",
+    "stop_speaking",
+    "get_tts",
+    
+    # Voice profiles
+    "ROBOTIC_DEEP",
+    "ROBOTIC_LIGHT",
+    "NATURAL_DEEP",
+    "FAST_RESPONSE",
+    "DRAMATIC",
+    "DEFAULT_PROFILE",
+    "get_profile_for_context",
+    "create_config",
+]

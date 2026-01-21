@@ -182,6 +182,34 @@ class SecurityLogger:
         self._logger.warning(
             f"ACTIONS_FETCH_FAILED | {task_id} | {error}"
         )
+    
+    # =========================================================================
+    # VOICE INPUT LOGGING (NEW)
+    # =========================================================================
+    
+    def voice_recording_started(self, source: str = "push_to_talk") -> None:
+        """Log voice recording started."""
+        self._logger.info(
+            f"VOICE_RECORDING_STARTED | source={source}"
+        )
+    
+    def voice_recording_stopped(self) -> None:
+        """Log voice recording stopped."""
+        self._logger.info(
+            "VOICE_RECORDING_STOPPED"
+        )
+    
+    def voice_transcription_complete(self, text_preview: str) -> None:
+        """Log voice transcription complete."""
+        self._logger.info(
+            f"VOICE_TRANSCRIPTION | preview={text_preview}"
+        )
+    
+    def voice_command_submitted(self, source: str, text_preview: str) -> None:
+        """Log voice command submitted (treated as untrusted input)."""
+        self._logger.info(
+            f"VOICE_COMMAND_SUBMITTED | source={source} | preview={text_preview}"
+        )
 
 
 # Global security logger instance
