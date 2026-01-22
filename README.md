@@ -514,12 +514,6 @@ python test_integration.py
 
 ---
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
 ## 🙏 Acknowledgments
 
 - **OpenAI Whisper** - State-of-the-art speech recognition
@@ -532,7 +526,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📧 Contact
 
 **Project Maintainer**: Sameer Kadam  
-**Email**: your.email@example.com  
+**Email**: sskadam6305@gmail.com  
 **Issues**: [GitHub Issues](https://github.com/yourusername/saarthi/issues)
 
 ---
