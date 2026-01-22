@@ -531,7 +531,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📧 Contact
 
-**Project Maintainer**: Pranav Kadam  
+**Project Maintainer**: Sameer Kadam  
 **Email**: your.email@example.com  
 **Issues**: [GitHub Issues](https://github.com/yourusername/saarthi/issues)
 
