@@ -444,15 +444,43 @@ class SimpleTTS:
     Simple TTS wrapper - uses Windows SAPI (always available).
     
     For production, use the full TTSManager from voice/tts_engine.py
+    
+    FAULT TOLERANCE:
+    - Catches all exceptions to prevent crashes
+    - Retries initialization on failure
+    - Graceful degradation (no speech rather than crash)
+    
+    TTS POLICY:
+    - Sanitizes text to remove URLs, file paths, commands
+    - Won't speak technical content
     """
+    
+    # Patterns to remove from speech (URLs, paths, etc.)
+    _URL_PATTERN = None
+    _PATH_PATTERN = None
     
     def __init__(self):
         self._engine = None
         self._lock = threading.Lock()
         self._initialized = False
+        self._init_attempts = 0
+        self._max_init_attempts = 3
+        
+        # Compile patterns for sanitization
+        import re
+        SimpleTTS._URL_PATTERN = re.compile(r'https?://[^\s]+|www\.[^\s]+', re.IGNORECASE)
+        SimpleTTS._PATH_PATTERN = re.compile(r'[A-Z]:\\[^\s]+|/(?:home|usr|var)/[^\s]+', re.IGNORECASE)
     
     def initialize(self) -> bool:
-        """Initialize TTS engine."""
+        """Initialize TTS engine with retry logic."""
+        if self._initialized:
+            return True
+        
+        self._init_attempts += 1
+        if self._init_attempts > self._max_init_attempts:
+            logger.warning("TTS init max attempts reached, disabling TTS")
+            return False
+        
         try:
             import win32com.client
             self._engine = win32com.client.Dispatch("SAPI.SpVoice")
@@ -462,52 +490,96 @@ class SimpleTTS:
             self._engine.Volume = 90
             
             # Try to find David voice (deep male)
-            voices = self._engine.GetVoices()
-            for i in range(voices.Count):
-                voice = voices.Item(i)
-                if "David" in voice.GetDescription():
-                    self._engine.Voice = voice
-                    break
+            try:
+                voices = self._engine.GetVoices()
+                for i in range(voices.Count):
+                    voice = voices.Item(i)
+                    if "David" in voice.GetDescription():
+                        self._engine.Voice = voice
+                        break
+            except Exception:
+                pass  # Use default voice
             
             self._initialized = True
             logger.info("TTS initialized (Windows SAPI)")
             return True
             
         except Exception as e:
-            logger.warning(f"TTS initialization failed: {e}")
+            logger.warning(f"TTS initialization failed (attempt {self._init_attempts}): {e}")
             return False
     
+    def _sanitize_text(self, text: str) -> str:
+        """
+        Sanitize text before speaking.
+        Removes URLs, file paths, and other technical content.
+        """
+        if not text:
+            return ""
+        
+        result = text
+        
+        # Remove URLs
+        if SimpleTTS._URL_PATTERN:
+            result = SimpleTTS._URL_PATTERN.sub('', result)
+        
+        # Remove file paths
+        if SimpleTTS._PATH_PATTERN:
+            result = SimpleTTS._PATH_PATTERN.sub('the file', result)
+        
+        # Remove .exe references
+        import re
+        result = re.sub(r'\b\w+\.exe\b', '', result, flags=re.IGNORECASE)
+        
+        # Clean up whitespace
+        result = re.sub(r'\s+', ' ', result).strip()
+        
+        # Remove trailing prepositions
+        result = re.sub(r'\s+(at|to|from)\s*$', '', result, flags=re.IGNORECASE)
+        
+        return result.strip(' .,')
+    
     def speak(self, text: str, async_mode: bool = True):
-        """Speak text."""
+        """Speak text with sanitization and fault tolerance."""
         if not self._initialized:
+            # Try to initialize if not done
+            if not self.initialize():
+                return
+        
+        # Sanitize text
+        safe_text = self._sanitize_text(text)
+        if not safe_text or len(safe_text) < 2:
             return
         
         if async_mode:
             thread = threading.Thread(
                 target=self._speak_sync,
-                args=(text,),
+                args=(safe_text,),
                 daemon=True,
             )
             thread.start()
         else:
-            self._speak_sync(text)
+            self._speak_sync(safe_text)
     
     def _speak_sync(self, text: str):
-        """Speak synchronously."""
+        """Speak synchronously with fault tolerance."""
         with self._lock:
             try:
                 # SVSFlagsAsync = 1 for async
                 self._engine.Speak(text, 1)
             except Exception as e:
                 logger.error(f"TTS speak failed: {e}")
+                # Mark as not initialized to try again next time
+                self._initialized = False
+                self._init_attempts = 0  # Allow reinit
     
     def stop(self):
-        """Stop speaking."""
+        """Stop speaking with fault tolerance."""
         if self._initialized:
             try:
                 self._engine.Speak("", 2)  # SVSFPurgeBeforeSpeak
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"TTS stop failed: {e}")
+                # Don't crash, just continue
 
 
 # =============================================================================
