@@ -298,9 +298,12 @@ class SafeTTS:
         Returns:
             True if text was spoken, False if blocked by policy
         """
+        # Lazy initialization on first speak
         if not self._initialized:
-            logger.warning("SafeTTS not initialized")
-            return False
+            logger.info("SafeTTS auto-initializing on first speak")
+            if not self.initialize():
+                logger.error("SafeTTS initialization failed")
+                return False
         
         # Process through policy
         safe_text = self._policy_enforcer.process_for_speech(text, category)
@@ -314,7 +317,12 @@ class SafeTTS:
         
         try:
             if hasattr(self._engine, 'speak'):
-                self._engine.speak(safe_text, async_mode)
+                # Try calling with async_mode parameter
+                try:
+                    self._engine.speak(safe_text, async_mode)
+                except TypeError:
+                    # Engine doesn't support async_mode, call with just text
+                    self._engine.speak(safe_text)
             elif hasattr(self._engine, '_speak_sync'):
                 if async_mode:
                     import threading

@@ -204,11 +204,13 @@ class LatencyTracker:
         values.sort()
         n = len(values)
         
+        # Percentile calculation: for n=100, p50 should be at index 49 (50th element)
+        # Use max(0, index-1) to handle the off-by-one correctly
         return {
-            "p50": values[int(n * 0.50)],
-            "p90": values[int(n * 0.90)],
-            "p95": values[int(n * 0.95)],
-            "p99": values[min(int(n * 0.99), n - 1)],
+            "p50": values[max(0, int(n * 0.50) - 1)] if n > 0 else 0,
+            "p90": values[max(0, int(n * 0.90) - 1)] if n > 0 else 0,
+            "p95": values[max(0, int(n * 0.95) - 1)] if n > 0 else 0,
+            "p99": values[max(0, min(int(n * 0.99), n - 1))] if n > 0 else 0,
             "count": n,
             "min": values[0],
             "max": values[-1],

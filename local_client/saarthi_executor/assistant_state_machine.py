@@ -29,7 +29,29 @@ STATE DIAGRAM:
     │                      └────────────────────────────▶│ SPEAKING ││
     │                                                    └──────────┘│
     └─────────────────────────────────────────────────────────────────┘
+
+PUBLIC API:
+    - AssistantState: Enum of all states
+    - StateConfig: Configuration for timeouts
+    - StateTransition: Immutable transition record
+    - StateTransitionError: Exception for invalid transitions
+    - AssistantStateMachine: The state machine itself
+    - create_state_machine: Factory function
+    - requires_state: Decorator for state-aware functions
+    - transitions_to: Decorator for automatic transitions
 """
+
+# Public API exports
+__all__ = [
+    'AssistantState',
+    'StateConfig',
+    'StateTransition',
+    'StateTransitionError',
+    'AssistantStateMachine',
+    'create_state_machine',
+    'requires_state',
+    'transitions_to',
+]
 
 import logging
 import threading

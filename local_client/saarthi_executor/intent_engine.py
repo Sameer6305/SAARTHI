@@ -161,17 +161,18 @@ class TextNormalizer:
     """
     
     # Filler words to remove
+    # NOTE: Do NOT remove greeting words (hi, hello, hey) or confirmation words (ok, okay) - they are valid intents!
     FILLER_WORDS: Set[str] = {
         # Politeness
         "please", "kindly", "would", "could", "can",
         # Hedging
         "maybe", "perhaps", "just", "actually", "basically",
         # Discourse markers
-        "so", "well", "like", "um", "uh", "okay", "ok",
+        "so", "well", "like", "um", "uh",
         # Self-reference (removing "I want to" etc.)
         "i", "want", "to", "need", "like",
         # Assistant references
-        "hey", "hi", "hello", "saarthi", "sarthi", "assistant",
+        "saarthi", "sarthi", "assistant",
     }
     
     # Contraction expansions
@@ -258,8 +259,13 @@ class TextNormalizer:
         Extract primary verb and object from normalized text.
         
         Returns (verb, object) tuple.
+        Single word input returns (word, None).
         """
         normalized = cls.normalize(text)
+        
+        if not normalized:
+            return None, None
+        
         words = normalized.split()
         
         if not words:
