@@ -82,5 +82,85 @@
   {
     "text": "Boi chicken",
     "timestamp": 1769683537.2587447
+  },
+  {
+    "text": "open youtube",
+    "intent": "open_website",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-03T23:58:19.861145"
+  },
+  {
+    "text": "Open YouTube and search new songs.",
+    "intent": "multi_step",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-03T23:59:21.889387"
+  },
+  {
+    "text": "Who is Elon Musk?",
+    "intent": "question",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-03T23:59:51.099559"
+  },
+  {
+    "text": "Open Spotify",
+    "intent": "open_website",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:00:14.575963"
+  },
+  {
+    "text": "Open Chrome.",
+    "intent": "open_application",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:00:33.750677"
+  },
+  {
+    "text": "Yes.",
+    "intent": "confirmation_yes",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:01:33.842277"
+  },
+  {
+    "text": "Yes.",
+    "intent": "confirmation_yes",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:02:18.955578"
+  },
+  {
+    "text": "Explain artificial intelligence.",
+    "intent": "explanation",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:02:33.625719"
+  },
+  {
+    "text": "Who eats alone must?",
+    "intent": "question",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:04:25.918881"
+  },
+  {
+    "text": "Who are you?",
+    "intent": "question",
+    "success": false,
+    "confidence": 0.0,
+    "was_follow_up": false,
+    "timestamp": "2026-02-04T00:04:38.671484"
   }
 ]

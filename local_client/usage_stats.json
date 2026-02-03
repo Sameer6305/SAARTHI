@@ -1,0 +1,27 @@
+{
+  "website": {
+    "youtube": {
+      "count": 1.999928917266903,
+      "last_used": 1770143361.2328143,
+      "total_uses": 2,
+      "first_seen": 1770143299.81515,
+      "categories": []
+    },
+    "spotify": {
+      "count": 1.0,
+      "last_used": 1770143414.5629625,
+      "total_uses": 1,
+      "first_seen": 1770143414.5629625,
+      "categories": []
+    }
+  },
+  "app": {
+    "chrome": {
+      "count": 1.0,
+      "last_used": 1770143433.7426782,
+      "total_uses": 1,
+      "first_seen": 1770143433.7426782,
+      "categories": []
+    }
+  }
+}

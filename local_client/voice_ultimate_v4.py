@@ -66,7 +66,7 @@ from saarthi_executor.integrated_assistant import create_assistant, SimpleTTS
 from saarthi_executor.assistant_state_machine import (
     AssistantStateMachine, AssistantState
 )
-from saarthi_executor.metrics import MetricsCollector
+from saarthi_executor.metrics import get_metrics
 from saarthi_executor.intent_engine import IntentEngine, IntentType, ParsedIntent
 
 # NEW v4 product modules
@@ -155,7 +155,7 @@ class WhisperSTTV4:
         self.language = language
         self._model = None
         self._lock = threading.Lock()
-        self._metrics = MetricsCollector.instance()
+        self._metrics = get_metrics()
     
     def initialize(self) -> bool:
         """Load Whisper model."""
@@ -285,7 +285,7 @@ class ActionExecutorV4:
         self._offline = offline
         self._confirmation = confirmation
         self._tts = tts
-        self._metrics = MetricsCollector.instance()
+        self._metrics = get_metrics()
     
     def execute(self, intent: ParsedIntent, context: SessionContext) -> Dict[str, Any]:
         """Execute intent with full context."""
@@ -918,7 +918,7 @@ class SaarthiVoiceAssistantV4:
         
         # Core infrastructure
         self._state_machine: Optional[AssistantStateMachine] = None
-        self._metrics = MetricsCollector.instance()
+        self._metrics = get_metrics()
         self._intent_engine: Optional[IntentEngine] = None
         
         # I/O
