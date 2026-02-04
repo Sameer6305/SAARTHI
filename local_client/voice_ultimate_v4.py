@@ -93,6 +93,13 @@ from saarthi_executor.visual_indicator import (
 )
 from saarthi_executor.audio_feedback import AudioFeedback, FeedbackType
 
+# NEW: Bug fix modules (v4.1)
+from saarthi_executor.input_normalizer import get_normalizer
+from saarthi_executor.intent_router import get_router, RouteCategory
+from saarthi_executor.multi_step_executor import create_context_executor
+from saarthi_executor.knowledge_answerer import get_knowledge_answerer
+from saarthi_executor.student_mode import get_student_handler
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -941,6 +948,13 @@ class SaarthiVoiceAssistantV4:
         self._history: Optional[CommandHistoryV4] = None
         self._assistant = None
         
+        # NEW: Bug fix modules (v4.1)
+        self._input_normalizer = None
+        self._intent_router = None
+        self._context_executor = None
+        self._knowledge_answerer = None
+        self._student_handler = None
+        
         # State
         self._initialized = False
         self._running = False
@@ -1043,6 +1057,15 @@ class SaarthiVoiceAssistantV4:
                 executor=self._executor,
             )
             
+            # NEW: Bug fix components (v4.1)
+            print("🔧 Initializing bug fix modules...")
+            self._input_normalizer = get_normalizer()
+            self._intent_router = get_router()
+            self._context_executor = create_context_executor(self._executor)
+            self._knowledge_answerer = get_knowledge_answerer(offline_manager=self._offline)
+            self._student_handler = get_student_handler()
+            print("   ✓ Input normalizer, intent router, context executor, knowledge answerer, student mode")
+            
             # History
             print("📝 Loading history...")
             self._history = CommandHistoryV4(self.config.history_file)
@@ -1142,8 +1165,24 @@ class SaarthiVoiceAssistantV4:
             
             print(f"📝 You said: \"{text}\"")
             
+            # NEW: Normalize input (fix Hinglish, typos, broken English)
+            normalized_input = self._input_normalizer.normalize(text)
+            
+            # Safety check for critical actions
+            if not normalized_input.is_safe_to_process:
+                print(f"⚠️  Safety: Input too unclear for processing")
+                self._speak(f"I'm not sure what you mean. Can you say that more clearly?")
+                self._state_machine.force_idle("unsafe_input")
+                self._update_indicator(AssistantState.IDLE)
+                return
+            
+            # Use normalized text
+            working_text = normalized_input.normalized
+            if working_text != text:
+                print(f"🔧 Normalized: \"{working_text}\"")
+            
             # Check for focus mode commands
-            focus_level = self._focus.detect_activation(text)
+            focus_level = self._focus.detect_activation(working_text)
             if focus_level:
                 self._focus.activate(focus_level)
                 self._speak("Focus mode on. I'll be brief.")
@@ -1151,7 +1190,7 @@ class SaarthiVoiceAssistantV4:
                 self._update_indicator(AssistantState.IDLE)
                 return
             
-            if self._focus.detect_deactivation(text):
+            if self._focus.detect_deactivation(working_text):
                 self._focus.deactivate()
                 self._speak("Focus mode off.")
                 self._state_machine.force_idle("focus_mode_deactivated")
@@ -1164,42 +1203,51 @@ class SaarthiVoiceAssistantV4:
             
             # Check for follow-up
             was_follow_up = False
-            if self._follow_up.is_follow_up(text):
+            if self._follow_up.is_follow_up(working_text):
                 was_follow_up = True
-                result = self._follow_up.handle(text)
+                result = self._follow_up.handle(working_text)
                 if result:
                     self._handle_result(result, text, "follow_up", was_follow_up)
                     return
             
             # Normal intent classification
             print("🧠 Understanding...")
-            intent = self._intent_engine.classify(text)
+            intent = self._intent_engine.classify(working_text)
+            intent.original_text = text  # Preserve original
+            intent.normalized_text = working_text  # Track normalized
             
             print(f"   Intent: {intent.intent_type.value} ({intent.confidence:.0%})")
             
-            # Check if confirmation needed
-            assessment = self._confirmation.assess_action(
-                intent.intent_type.value,
-                text,
-                intent.confidence,
-            )
+            # NEW: Route intent through strict router
+            routing_decision = self._intent_router.route(intent)
+            print(f"🧭 Route: {routing_decision.category.value} (confidence: {routing_decision.confidence:.0%})")
             
-            if assessment.requires_confirmation:
-                # Ask for confirmation
-                self._speak(assessment.suggested_confirmation)
-                self._confirmation.create_pending(
-                    intent.intent_type.value, text, intent.slots, assessment
+            # Check if confirmation needed (for ACTION routes)
+            if routing_decision.category == RouteCategory.ACTION:
+                assessment = self._confirmation.assess_action(
+                    intent.intent_type.value,
+                    text,
+                    intent.confidence,
                 )
-                self._state_machine.force_idle("awaiting_confirmation")
-                self._update_indicator(AssistantState.IDLE)
-                return
+                
+                if assessment.requires_confirmation:
+                    # Ask for confirmation
+                    self._speak(assessment.suggested_confirmation)
+                    self._confirmation.create_pending(
+                        intent.intent_type.value, text, intent.slots, assessment
+                    )
+                    self._state_machine.force_idle("awaiting_confirmation")
+                    self._update_indicator(AssistantState.IDLE)
+                    return
             
             # EXECUTING
             self._state_machine.transition(AssistantState.EXECUTING, "intent_classified")
             self._update_indicator(AssistantState.EXECUTING)
             
             context = self._memory.get_context()
-            result = self._executor.execute(intent, context)
+            
+            # NEW: Execute based on route category
+            result = self._execute_routed_intent(intent, routing_decision, context)
             
             self._handle_result(result, text, intent.intent_type.value, was_follow_up)
             
@@ -1212,6 +1260,100 @@ class SaarthiVoiceAssistantV4:
             self._update_indicator(AssistantState.ERROR)
             time.sleep(0.5)
             self._update_indicator(AssistantState.IDLE)
+    
+    def _execute_routed_intent(self, intent: ParsedIntent, routing_decision, context: Dict) -> Dict[str, Any]:
+        """
+        NEW: Execute intent based on routing decision.
+        Routes to appropriate handler: knowledge, student, action, or context-preserving executor.
+        """
+        category = routing_decision.category
+        
+        if category == RouteCategory.KNOWLEDGE:
+            print("📚 Routing to knowledge system")
+            # Extract topic
+            topic = intent.parameters.get("query", intent.text if hasattr(intent, 'text') else str(intent))
+            # Get answer
+            answer = self._knowledge_answerer.answer(topic)
+            return {
+                "success": True,
+                "text": answer.text,
+                "source": answer.source,
+                "confidence": answer.confidence,
+                "speak": True,
+                "category": SpeechCategory.ANSWER,
+            }
+        
+        elif category == RouteCategory.STUDENT:
+            print("🎓 Routing to student mode")
+            # Get student response
+            query = intent.text if hasattr(intent, 'text') else str(intent)
+            response = self._student_handler.handle_student_request(query)
+            return {
+                "success": True,
+                "text": response.text,
+                "source": "student_mode",
+                "confidence": 0.9,  # High confidence for student mode
+                "speak": True,
+                "category": SpeechCategory.ANSWER,
+            }
+        
+        elif category == RouteCategory.ACTION:
+            # Check if multi-step
+            if intent.intent_type == IntentType.MULTI_STEP:
+                print("🔗 Routing to context-preserving executor")
+                # Use new multi-step executor
+                result = self._context_executor.execute_multi_step(intent, context)
+                return {
+                    "success": result.success,
+                    "text": result.final_message,
+                    "confidence": 0.9,  # High confidence for successful multi-step
+                    "speak": True,
+                    "category": SpeechCategory.SUCCESS,
+                }
+            else:
+                print("⚡ Routing to action executor")
+                # Use existing executor for single-step actions
+                return self._executor.execute(intent, context)
+        
+        elif category == RouteCategory.CONVERSATIONAL:
+            print("💬 Routing to conversational handler")
+            # Simple conversational responses
+            responses = {
+                "greeting": "Hello! How can I help you?",
+                "goodbye": "Goodbye! Have a great day!",
+                "thanks": "You're welcome! Happy to help.",
+            }
+            response_text = responses.get(intent.intent_type.value.lower(), "I'm here to help!")
+            return {
+                "success": True,
+                "text": response_text,
+                "speak": True,
+                "category": SpeechCategory.STATUS,
+            }
+        
+        elif category == RouteCategory.AMBIGUOUS:
+            print("❓ Ambiguous intent - asking for clarification")
+            clarification = routing_decision.clarification_question or "I'm not sure what you mean. Can you rephrase?"
+            return {
+                "success": False,
+                "text": clarification,
+                "speak": True,
+                "category": SpeechCategory.ERROR,
+            }
+        
+        else:  # SYSTEM or INVALID
+            print("⚙️  Routing to system/fallback handler")
+            # Try executor as fallback
+            try:
+                return self._executor.execute(intent, context)
+            except Exception as e:
+                logger.error(f"Execution failed: {e}")
+                return {
+                    "success": False,
+                    "text": f"I couldn't process that request. Error: {str(e)}",
+                    "speak": True,
+                    "category": SpeechCategory.ERROR,
+                }
     
     def _handle_result(self, result: Dict[str, Any], text: str, 
                        intent_type: str, was_follow_up: bool):
