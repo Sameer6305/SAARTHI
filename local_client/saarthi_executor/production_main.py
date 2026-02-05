@@ -77,37 +77,35 @@ class ProductionConfig:
     # LLM (optional)
     enable_llm: bool = False
     llm_endpoint: str = "http://localhost:11434/api/generate"
-    llm_model: str = "phi3"
+    llm_model: str = "llama3.1"  # Ollama model: llama3.1, phi3, mistral, etc.
 
 
 # =============================================================================
 # LLM CALLBACK (Optional)
 # =============================================================================
 
-def create_ollama_callback(config: ProductionConfig) -> Optional[Callable]:
-    """Create Ollama LLM callback if enabled."""
+def create_llm_callback(config: ProductionConfig) -> Optional[Callable]:
+    """
+    Create LLM callback using local Ollama instance.
+    
+    Returns:
+        Callable that takes a prompt and returns response text, or None if LLM disabled
+    """
     if not config.enable_llm:
         return None
     
-    def ollama_callback(prompt: str) -> str:
-        try:
-            import requests
-            response = requests.post(
-                config.llm_endpoint,
-                json={
-                    "model": config.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            return response.json().get("response", "I couldn't generate a response.")
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return "I'm having trouble thinking right now. Please try again."
+    from saarthi_executor.openai_config import create_ollama_llm_callback
     
-    return ollama_callback
+    try:
+        logger.info(f"Initializing Ollama LLM with model: {config.llm_model}")
+        return create_ollama_llm_callback(
+            model=config.llm_model,
+            temperature=0.7,
+        )
+    except RuntimeError as e:
+        logger.error(f"Ollama setup failed: {e}")
+        logger.info("Continuing without LLM support")
+        return None
 
 
 # =============================================================================
@@ -176,7 +174,7 @@ class ProductionVoiceSystem:
             
             # Initialize production assistant
             from saarthi_executor.production_router import create_production_assistant
-            llm_callback = create_ollama_callback(self.config)
+            llm_callback = create_llm_callback(self.config)
             self._assistant = create_production_assistant(
                 llm_callback=llm_callback,
                 enable_tts=False,  # We handle TTS via feedback manager
@@ -332,6 +330,7 @@ def main():
     print("SAARTHI Production Voice Assistant")
     print("=" * 60)
     print()
+    
     print("Controls:")
     print("  • Hold Ctrl+Space to speak")
     print("  • Release to process")
@@ -341,8 +340,28 @@ def main():
     # Configuration
     config = ProductionConfig(
         enable_tts=True,
-        enable_llm=False,  # Set to True if Ollama is running
+        enable_llm=False,  # Set to True to enable LLM
+        llm_model="llama3.1",
     )
+    
+    # Show LLM status and check Ollama
+    if config.enable_llm:
+        print(f"LLM Model: {config.llm_model}")
+        print("Checking Ollama availability...")
+        
+        from saarthi_executor.openai_config import check_ollama
+        is_available, message = check_ollama(config.llm_model)
+        print(message)
+        
+        if not is_available:
+            print()
+            print("Continuing without LLM support...")
+            config.enable_llm = False
+        print()
+    else:
+        print("LLM: Disabled (knowledge base and patterns only)")
+        print("  Set enable_llm=True in code to enable Ollama LLM")
+        print()
     
     # Create and run system
     system = ProductionVoiceSystem(config)
